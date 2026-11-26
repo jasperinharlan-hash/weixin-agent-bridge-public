@@ -1,0 +1,2235 @@
+# -*- coding: utf-8 -*-
+"""Web 前端桥接层：pywebview js_api 方法面 + 后端推送循环。
+
+替代 PySide6 UI 的数据层：前端经 window.pywebview.api.* 调用本模块方法
+（pywebview 自动 Promise 化，返回值须 JSON 可序列化），后端经
+evaluate_js 注入 window.__push(evt, payload) 推送事件。
+
+设计约定：
+- 统一返回 {ok: bool, ...}，失败 {ok: False, error}（_safe 装饰器兜底，
+  桥内异常绝不炸掉调用线程）。
+- 长操作（天枢安装/发首轮提示词/余额查询）起 daemon 线程，结果经推送
+  事件回前端——对齐旧 UI 的「工作线程 + 结果回写」模式。
+- bot 属性热写保持旧 UI 语义：多数为 GIL 原子赋值；chat_card_* /
+  chat_feature_overrides 整表替换；providers 变更后统一走
+  AppContext.reproject_and_push 重投影。
+- 不 import xiaoli_app.ui（那个包依赖 PySide6）——壁纸库扫描/主题推荐
+  壁纸清单在此就地重写，保证将来删除旧 UI 后本层无 Qt 依赖。
+"""
+from __future__ import annotations
+
+import base64
+import ctypes
+import functools
+import io
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+
+from PIL import Image
+
+from . import balance, config_store, pricing, setup, update_check, web_search
+from .card_store import (delete_card as cs_delete_card,
+                         duplicate_card as cs_duplicate_card,
+                         export_card as cs_export_card,
+                         get_card as cs_get_card,
+                         import_card as cs_import_card,
+                         list_cards as cs_list_cards,
+                         save_card as cs_save_card)
+from .memory_store import MemoryStore, memory_key, render_export_markdown
+from .remote_server import RemoteHub, RemoteServer, lan_ip
+from .reminders_store import RemindersStore
+from .usage_store import UsageStore, hit_ratio
+from .version import APP_VERSION
+
+logger = logging.getLogger("xiaoli")
+
+# wechat_bot 是仓库根的顶层模块（与 xiaoli_app 平级），只在用到处延迟导入，
+# 避免 import 环（wechat_bot 反向引用 xiaoli_app.*）。
+_MODEL_TIP = "strip_model_prefix / models_endpoint 延迟导入自 wechat_bot"
+
+# 使用文档入口（首启完成页 / 设置页顶部共用，只维护这一处）。
+# 指向仓库 docs 目录的索引页；文档改名时同步这里与 README 入口。
+DOCS_URL = ("https://github.com/wens6515/weixin-wechat-wxauto-ocr-xiaoli/"
+            "blob/main/docs/使用文档/README.md")
+
+
+def _proxies_from_cfg(cfg: dict) -> dict | None:
+    """web_proxy → requests 的 proxies 字典（空 = 直连）。"""
+    p = str((cfg or {}).get("web_proxy") or "").strip()
+    return {"http": p, "https": p} if p else None
+
+
+# ---------- 路径与壁纸库（自 ui 包摘出的无 Qt 版本） ----------
+
+def app_base_dir() -> str:
+    """应用基目录：打包态 = exe 所在目录；源码态 = xiaoli_desktop 根，
+    可用 XIAOLI_HOME 环境变量重定向（开发/验证时隔离真实 config.json）。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    env = os.environ.get("XIAOLI_HOME")
+    if env:
+        return env
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def webui_dir() -> str:
+    """Web 前端静态资产目录。打包态 PyInstaller datas 落在 sys._MEIPASS
+    （onedir 模式 = _internal）；源码态固定跟模块位置（xiaoli_desktop/webui），
+    不随 XIAOLI_HOME 重定向——那是数据目录，前端资产是程序文件。"""
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, "webui")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "webui")
+
+
+_WALLPAPER_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+_DEFAULT_WALLPAPER_KEY = "二次元角色-动漫"
+_WALLPAPER_DIR_NAMES = ("壁纸", "wallpapers")
+
+
+def wallpapers_dir() -> str:
+    """内置壁纸目录：基目录及其父目录下的「壁纸」/「wallpapers」。"""
+    base = app_base_dir()
+    for p in (base, os.path.dirname(base)):
+        for name in _WALLPAPER_DIR_NAMES:
+            d = os.path.join(p, name)
+            if os.path.isdir(d):
+                return d
+    return os.path.join(base, "壁纸")
+
+
+def list_wallpapers() -> list[tuple[str, str]]:
+    """扫描内置壁纸目录，返回 [(绝对路径, 文件名)] 按文件名排序。"""
+    d = wallpapers_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    out = []
+    for f in names:
+        if f.lower().endswith(_WALLPAPER_EXTS) and os.path.isfile(os.path.join(d, f)):
+            out.append((os.path.join(d, f), f))
+    return out
+
+
+def default_wallpaper_path() -> str:
+    """默认壁纸：文件名含「二次元角色-动漫」的那张；否则第一张；空目录返回 ""。"""
+    items = list_wallpapers()
+    for p, f in items:
+        if _DEFAULT_WALLPAPER_KEY in f:
+            return p
+    return items[0][0] if items else ""
+
+
+def resolve_wallpaper_path(wp: str) -> str:
+    """壁纸路径解析：绝对路径原样；裸文件名在内置目录里找同名文件。"""
+    if not wp or os.path.isabs(wp):
+        return wp
+    base = os.path.basename(wp)
+    for p, f in list_wallpapers():
+        if f == wp or f == base:
+            return p
+    return wp
+
+
+def wallpaper_short_name(fname: str) -> str:
+    """去「哲风壁纸」前缀与扩展名的展示名。"""
+    for prefix in ("【哲风壁纸】", "哲风壁纸-"):
+        if fname.startswith(prefix):
+            fname = fname[len(prefix):]
+            break
+    return os.path.splitext(fname)[0] or fname
+
+
+# 每套主题的推荐壁纸（对齐旧 UI ui/__init__.py THEMES 的 wallpaper 键；
+# tokyonight 无推荐——切到它不动壁纸）。
+THEME_WALLPAPER = {
+    "abyss": "小漓主题.jpg",
+    "neon": "赛博朋克-壁纸.jpg",
+    "tokyonight": "",
+    "stellar": "典雅暗黑-暗夜.jpg",
+    "moxin": "东方水墨-仙侠-古风.jpg",
+    "cream": "软萌治愈-动物-可爱.jpg",
+    "mint": "户外-活力少女-清新.jpg",
+}
+THEME_LABELS = {
+    "abyss": "深海小漓", "neon": "霓虹夜行", "tokyonight": "Tokyo Night",
+    "stellar": "星夜紫金", "moxin": "墨染", "cream": "奶油晨光", "mint": "薄荷气泡",
+}
+THEME_GROUPS = {
+    "abyss": "深色", "neon": "深色", "tokyonight": "深色", "stellar": "深色",
+    "moxin": "浅色", "cream": "浅色", "mint": "浅色",
+}
+
+# save_config 允许前端写入的键白名单（其余键只读——providers/tasks_dir 等
+# 走各自专用方法，避免整包 patch 误伤派生键）。
+_ALLOWED_KEYS = {
+    "theme", "follow_system", "wallpaper_path", "card_opacity", "panel_opacity",
+    "font_scale", "wall_opacity", "blur_level",
+    "memory_deep_enabled", "memory_compress_enabled", "memory_keep_recent",
+    "memory_compress_batch", "memory_important_max", "memory_compress_model",
+    "memory_rolling_step",
+    "max_context_tokens", "reply_max_tokens",
+    "segment_wait_enabled", "segment_wait_seconds",
+    "segment_jitter_enabled", "segment_jitter_min", "segment_jitter_max",
+    "file_storage_path", "web_search_enabled", "web_proxy", "task_enabled",
+    "state_watch_enabled", "model_trigger_manage", "sticker_mode",
+    "voice_mode", "tts_endpoint", "tts_timeout_seconds", "voice_max_seconds",
+    "voice_profiles", "active_voice_profile_id",
+    "chat_feature_overrides", "first_prompt_path", "bot_nickname",
+    "start_paused",
+    "no_reply_enabled", "global_memory_enabled", "shared_pool_enabled",
+    "persona_state_enabled",
+    "media_wait_mode", "media_wait_seconds", "media_wait_quiet_seconds",
+    "followup_enabled", "followup_delay_min", "followup_delay_max",
+    "followup_cooldown_minutes", "followup_daily_max", "followup_private_only",
+    "group_reply_mode",
+    "proactive_enabled", "proactive_interval_min", "proactive_interval_max",
+    "proactive_idle_minutes", "proactive_cooldown_minutes",
+    "proactive_private_only", "proactive_active_days",
+    "proactive_quiet_enabled", "proactive_quiet_start", "proactive_quiet_end",
+    "daily_cost_limit_enabled", "daily_cost_limit",
+    "media_send_enabled", "image_gen_endpoint", "image_gen_model",
+    "image_gen_api_key",
+    # remote_token 不进白名单：令牌只经 remote_reset_token 生成/重置，
+    # 不接受前端 patch 直写（明文 token 不混进通用保存路径）
+    "remote_enabled", "remote_lan", "remote_port",
+}
+
+# 写 cfg 后需要同步热写到 bot 属性的键（旧 UI 设置页语义：先落盘再热写）。
+# 注意 no_reply/global_memory/shared_pool 是工具声明开关——热写后下一轮
+# 请求的 tools 数组即变（前缀缓存整条作废一次，属设置变更的正常代价）。
+_BOT_HOT_KEYS = {
+    "web_search_enabled", "task_enabled", "state_watch_enabled",
+    "model_trigger_manage", "sticker_mode",
+    "memory_deep_enabled", "memory_compress_enabled", "memory_keep_recent",
+    "memory_compress_batch", "memory_important_max", "memory_rolling_step",
+    "max_context_tokens", "reply_max_tokens",
+    "segment_wait_enabled", "segment_wait_seconds",
+    "segment_jitter_enabled", "segment_jitter_min", "segment_jitter_max",
+    "file_storage_path",
+    "voice_mode", "tts_endpoint", "voice_max_seconds", "voice_profiles",
+    "active_voice_profile_id",
+    "no_reply_enabled", "global_memory_enabled", "shared_pool_enabled",
+    "persona_state_enabled",
+    "media_wait_mode", "media_wait_seconds", "media_wait_quiet_seconds",
+    "followup_enabled", "followup_delay_min", "followup_delay_max",
+    "followup_cooldown_minutes", "followup_daily_max", "followup_private_only",
+    "group_reply_mode",
+    "proactive_enabled", "proactive_interval_min", "proactive_interval_max",
+    "proactive_idle_minutes", "proactive_cooldown_minutes",
+    "proactive_private_only", "proactive_active_days",
+    "proactive_quiet_enabled", "proactive_quiet_start", "proactive_quiet_end",
+    "daily_cost_limit_enabled", "daily_cost_limit",
+    "media_send_enabled", "image_gen_endpoint", "image_gen_model",
+    "image_gen_api_key",
+}
+
+_TERMINAL_STATES = ("已触发", "已错过", "已达成", "已到期", "已失效")
+
+
+def trigger_state_text(r: dict, now: float | None = None) -> str:
+    """触发器状态徽章文本（自旧 UI pages.py 搬入的纯函数）。"""
+    now = time.time() if now is None else now
+    if r.get("kind") == "condition":
+        done = r.get("done")
+        if done == "met":
+            return "已达成"
+        if done == "expired":
+            return "已到期"
+        if done == "dead":
+            return "已失效"
+        return "已暂停" if not r.get("enabled") else "监视中"
+    if not r.get("enabled"):
+        if r.get("missed"):
+            return "已错过"
+        return "已触发" if r.get("last_fired") else "已暂停"
+    return "触发中" if (r.get("fire_at") or 0) <= now else "待触发"
+
+
+def count_active_triggers(items) -> int:
+    """活跃触发器数（首页徽章）：启用中的定时 + 进行中的监视。"""
+    n = 0
+    for r in items or []:
+        if not r.get("enabled"):
+            continue
+        if r.get("kind") == "condition":
+            if not r.get("done"):
+                n += 1
+        else:
+            n += 1
+    return n
+
+
+def default_wechat_files_dir() -> str:
+    """微信文件接收目录默认值（自 xiaoli_gui 摘出的无 Qt 版本）。"""
+    docs = os.path.join(os.path.expanduser("~"), "Documents")
+    candidates = []
+    for base in (os.path.join(docs, "xwechat_files"),
+                 os.path.join(docs, "WeChat Files")):
+        if os.path.isdir(base):
+            try:
+                for sub in os.listdir(base):
+                    p = os.path.join(base, sub)
+                    if os.path.isdir(p):
+                        candidates.append(p)
+            except OSError:
+                pass
+            candidates.append(base)
+    if candidates:
+        return candidates[0]
+    return os.path.join(docs, "WeChat Files")
+
+
+def _first_run_needed(cfg_path: str, cfg: dict | None) -> bool:
+    """首次启动判定：config 文件不存在，或任务/微信文件目录未配置。"""
+    if not os.path.isfile(cfg_path):
+        return True
+    if cfg is None or not str(cfg.get("tasks_dir") or "").strip() \
+            or not str(cfg.get("file_storage_path") or "").strip():
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            if isinstance(disk, dict):
+                return not str(disk.get("tasks_dir") or "").strip() or \
+                    not str(disk.get("file_storage_path") or "").strip()
+        except (OSError, ValueError):
+            pass
+    return False
+
+
+def _safe(fn):
+    """js_api 方法兜底：异常转 {ok: False, error}，不让桥炸掉调用线程。"""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return wrapper
+
+
+class BridgeApi:
+    """pywebview js_api 入口：webview.create_window(js_api=self)。
+
+    生命周期：xiaoli_web.main() 构造（ctx 就绪后）→ 挂 _win（窗口创建后）
+    → start_push_loop()。quit_app() 请求退出：销毁窗口令 webview.start()
+    返回，由入口收尾（停引擎/停托盘）。
+    """
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self._win = None            # pywebview Window（启动后挂入）
+        self._tray = None           # pystray Icon（入口挂入，用于托盘气泡）
+        self._log_offset = 0        # bot_run.log 增量 tail 位移（字节）
+        self._img_cache: dict = {}  # (path, kind) -> (mtime, size, dataURI)
+        self._stop = threading.Event()
+        self._installing = False
+        # GUI 就绪闸：webview.start() 之前窗口还没进入消息循环，此时
+        # evaluate_js 会阻塞到超时（真机：远程面板开启时启动卡 ~20 秒——
+        # sync_remote_server 末尾 push 一条 remote_status 正好撞上）。
+        # 启动前的事件先入队，webview.start(func=on_gui_ready) 后补发。
+        self._gui_ready = False
+        self._pending_pushes: list[tuple[str, dict]] = []
+        self._push_lock = threading.Lock()
+        # 远程面板（remote_server.RemoteServer，sync_remote_server 启停）：
+        # push 事件统一过 hub——本地走 evaluate_js，远程订阅走 SSE
+        self.remote_hub = RemoteHub()
+        self._remote_server: RemoteServer | None = None
+        self._remote_port: int | None = None
+        self._remote_lan: bool | None = None
+
+    # ---------- 基础设施 ----------
+
+    def bind_window(self, win):
+        self._win = win
+
+    def bind_tray(self, tray):
+        self._tray = tray
+
+    def push(self, evt: str, payload: dict):
+        """向前端注入事件（窗口未就绪/正在销毁时静默跳过）。
+        事件同时进远程 hub（SSE 订阅者）——本地与远程共用同一事件流。
+
+        GUI 还没进入消息循环时只入队不 evaluate_js：pywebview 的窗口在
+        webview.start() 之前 evaluate_js 会阻塞到超时（启动卡 20 秒的根因）。
+        """
+        self.remote_hub.publish(evt, payload or {})
+        with self._push_lock:
+            ready = self._gui_ready
+            if not ready:
+                if len(self._pending_pushes) < 200:
+                    self._pending_pushes.append((evt, dict(payload or {})))
+                return
+        self._push_local(evt, payload)
+
+    def _push_local(self, evt: str, payload: dict):
+        win = self._win
+        if win is None:
+            return
+        try:
+            js = ("window.__push && window.__push(%s, %s);"
+                  % (json.dumps(evt), json.dumps(payload, ensure_ascii=False)))
+            win.evaluate_js(js)
+        except Exception:
+            pass
+
+    def on_gui_ready(self):
+        """webview.start(func=...) 回调：GUI 循环已起，补发启动前的事件。"""
+        logger.info("[启动] GUI 已就绪，前端事件通道打开")
+        with self._push_lock:
+            self._gui_ready = True
+            pending = list(self._pending_pushes)
+            self._pending_pushes.clear()
+        for evt, payload in pending:
+            self._push_local(evt, payload)
+
+    def notify(self, title: str, message: str):
+        """托盘气泡（托盘不可用时静默）。"""
+        tray = self._tray
+        if tray is None:
+            return
+        try:
+            tray.notify(title, message)
+        except Exception:
+            pass
+
+    def start_push_loop(self):
+        threading.Thread(target=self._push_loop, daemon=True,
+                         name="xiaoli-webpush").start()
+
+    def stop(self):
+        self._stop.set()
+        self._stop_remote_server()
+
+    # ---------- 远程面板（remote_server；设置页开关，默认关） ----------
+
+    @_safe
+    def remote_info(self) -> dict:
+        """远程面板访问信息：开关/端口/令牌/可直接打开的 URL（手机浏览器）。
+        URL 按绑定口径给地址——只绑 127.0.0.1 时给本机回环（此时手机连不上
+        是预期，提示开「局域网开放」）。"""
+        cfg = self.ctx.cfg
+        enabled = bool(cfg.get("remote_enabled"))
+        lan = bool(cfg.get("remote_lan"))
+        port = int(cfg.get("remote_port") or 8765)
+        token = str(cfg.get("remote_token") or "")
+        running = self._remote_server is not None
+        host = lan_ip() if lan else "127.0.0.1"
+        url = f"http://{host}:{port}/?t={token}" if token else ""
+        return {"ok": True, "enabled": enabled, "lan": lan, "running": running,
+                "port": port, "token": token, "url": url}
+
+    @_safe
+    def remote_reset_token(self) -> dict:
+        """重置远程访问令牌（已分发的旧链接立即失效），返回新的访问信息。"""
+        import secrets
+        self.ctx.cfg["remote_token"] = secrets.token_urlsafe(18)
+        try:
+            config_store.save_config(self.ctx.cfg, self.ctx.cfg_path)
+        except OSError as e:
+            return {"ok": False, "error": f"保存配置失败: {e}"}
+        self.sync_remote_server()
+        return self.remote_info()
+
+    def sync_remote_server(self) -> None:
+        """按当前配置启停/重启远程面板服务（启动时与 save_config 挂钩调用）。
+
+        口径：remote_enabled 开（或 remote_lan 开）→ 服务应运行；端口或绑定
+        口径变了 → 重启；全关 → 停。token 首次开启时自动生成并落盘。服务
+        起停互斥由 _remote_server 单一引用保证（桌面入口线程 + 设置保存线程
+        可能并发进来，全程持 _remote_lock）。"""
+        if not hasattr(self, "_remote_lock"):
+            self._remote_lock = threading.Lock()
+        with self._remote_lock:
+            cfg = self.ctx.cfg
+            want = bool(cfg.get("remote_enabled")) or bool(cfg.get("remote_lan"))
+            lan = bool(cfg.get("remote_lan"))
+            try:
+                port = int(cfg.get("remote_port") or 8765)
+            except (TypeError, ValueError):
+                port = 8765
+                cfg["remote_port"] = port
+            token = str(cfg.get("remote_token") or "")
+            if want and not token:
+                import secrets
+                token = secrets.token_urlsafe(18)
+                cfg["remote_token"] = token
+                try:
+                    config_store.save_config(cfg, self.ctx.cfg_path)
+                except OSError as e:
+                    logger.error(f"[远程] token 落盘失败: {e}")
+            unchanged = (self._remote_server is not None
+                         and self._remote_port == port
+                         and self._remote_lan == lan)
+            if not want:
+                self._stop_remote_server()
+                return
+            if unchanged:
+                return
+            self._stop_remote_server()
+            try:
+                server = RemoteServer(
+                    self, "0.0.0.0" if lan else "127.0.0.1", port, token,
+                    webui_dir())
+                server.start()
+            except OSError as e:
+                self._remote_server = None
+                logger.error(f"[远程] 面板服务启动失败（端口 {port} 占用？）: {e}")
+                self.push("remote_status", {
+                    "ok": False, "message": f"远程面板启动失败（端口 {port} "
+                                            f"被占用？）: {e}"})
+                return
+            self._remote_server = server
+            self._remote_port = port
+            self._remote_lan = lan
+            host = lan_ip() if lan else "127.0.0.1"
+            self.push("remote_status", {
+                "ok": True, "running": True,
+                "message": f"远程面板已开启: http://{host}:{port}/?t={token}"})
+
+    def _stop_remote_server(self) -> None:
+        server = getattr(self, "_remote_server", None)
+        if server is not None:
+            server.stop()
+            self._remote_server = None
+            self._remote_port = None
+            self._remote_lan = None
+
+    def _push_loop(self):
+        """1s 心跳：引擎状态 + bus 事件 + 日志增量 → 前端 tick 事件。
+        引擎进入 initialized（初始化成功）时自动发一轮首轮提示词——
+        任务桥关闭则跳过（对齐旧 UI：环境检查通过且引擎就绪后自动发送）。"""
+        prev_state = None
+        while not self._stop.wait(1.0):
+            try:
+                eng = self.ctx.engine
+                payload = {"state": eng.state, "error": eng.error}
+                bot = getattr(eng, "bot", None)
+                payload["paused"] = (bool(bot.paused) is True) if bot else None
+                if eng.state == "initialized" and prev_state != "initialized" \
+                        and not getattr(self, "_auto_prompted", False):
+                    self._auto_prompted = True
+                    self.send_first_prompt()
+                prev_state = eng.state
+                try:
+                    if self.ctx.bus is not None:
+                        for kind, pl in self.ctx.bus.drain():
+                            if kind == "error":
+                                payload["bus_error"] = str(pl.get("message") or "")
+                except Exception:
+                    pass
+                try:
+                    lines = self._tail_log_lines()
+                    if lines:
+                        payload["log"] = lines
+                except Exception:
+                    pass
+                self.push("tick", payload)
+            except Exception:
+                pass
+
+    # ---------- 日志 ----------
+
+    def _log_path(self) -> str:
+        # 与 bot 写入端同源：RUN_LOG_FILE 按 wechat_bot.__file__ 定位，
+        # frozen 态落在 _internal —— 前端 tail 必须读同一个文件
+        from wechat_bot import RUN_LOG_FILE
+        return RUN_LOG_FILE
+
+    def _tail_log_lines(self, cap: int = 400) -> list[str]:
+        p = self._log_path()
+        size = os.path.getsize(p)
+        if size < self._log_offset:      # 文件轮转/清空 → 从头重读
+            self._log_offset = 0
+        if size == self._log_offset:
+            return []
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(self._log_offset)
+            chunk = f.read()
+        self._log_offset = size
+        lines = [l for l in chunk.splitlines() if l.strip()]
+        return lines[-cap:]
+
+    @_safe
+    def tail_log(self) -> dict:
+        """前端首次进入日志页全量拉取（上限 800 行，之后靠 tick 增量）。"""
+        try:
+            self._log_offset = 0
+            lines = self._tail_log_lines(cap=800)
+        except OSError:
+            lines = []
+        return {"ok": True, "lines": lines}
+
+    # ---------- 状态与引擎 ----------
+
+    @_safe
+    def get_status(self) -> dict:
+        eng = self.ctx.engine
+        bot = getattr(eng, "bot", None)
+        items = RemindersStore().list()
+        return {"ok": True, "state": eng.state, "error": eng.error,
+                "bot_ready": bot is not None,
+                "paused": (bool(bot.paused) is True) if bot else None,
+                "version": APP_VERSION,
+                "trigger_active": count_active_triggers(items)}
+
+    @_safe
+    def engine_action(self, action: str) -> dict:
+        eng = self.ctx.engine
+        if action == "initialize":
+            ok = eng.initialize()
+        elif action == "start":
+            ok = eng.start_bot()
+        elif action == "pause":
+            eng.pause()
+            ok = True
+        elif action == "resume":
+            eng.resume()
+            ok = True
+        else:
+            return {"ok": False, "error": f"未知操作: {action}"}
+        return {"ok": bool(ok), "state": eng.state}
+
+    @_safe
+    def engine_error_detail(self) -> dict:
+        """初始化失败诊断：原始错误 + 现场检测（显示缩放 / 微信窗口）+
+        按错误类型生成的修复指引，供前端失败弹窗展示。
+
+        显示缩放已按档位自适应（175% 为标定档），不再作为失败原因——现场
+        检测仍读一次即时值让用户确认环境；指引集中在微信窗口与截图两类
+        可动手的故障上。"""
+        eng = self.ctx.engine
+        err = str(getattr(eng, "error", "") or "")
+        scale, wechat_found = 0, None
+        try:
+            from wx_backend.visual_win32 import find_wechat_window, monitor_dpi_scale
+            hwnd = find_wechat_window()
+            wechat_found = hwnd is not None
+            scale = monitor_dpi_scale(hwnd if hwnd else None)
+        except Exception:
+            pass
+        hints = []
+        if "未找到微信主窗口" in err or "微信连接失败" in err:
+            hints.append("打开电脑版微信（PC 4.x）并完成登录，保持窗口打开"
+                         "（不要最小化），然后点「重试初始化」")
+        if "PrintWindow" in err or "截图" in err:
+            hints.append("微信窗口可能被最小化或渲染异常：把它恢复显示后重试；"
+                         "仍失败就依次重启微信和小漓")
+        if not hints:
+            hints.append("确认微信已打开并登录，然后点「重试初始化」；"
+                         "持续失败请重启小漓")
+        return {"ok": True, "error": err, "scale": scale,
+                "wechat_found": wechat_found, "hints": hints}
+
+    # ---------- 配置 ----------
+
+    @_safe
+    def persona_state_overview(self) -> dict:
+        """状态页数据：状态层开关 + 当前时段 + 各聊天最新状态快照。
+
+        存储键是 memory_key 归一化名——能从记忆总览映射回原始聊天名的
+        （用户在微信里看到的名字）就映射，映射不到的显示归一化键。"""
+        from .persona_state import PersonaStateStore, period_label
+        cfg = self.ctx.cfg
+        enabled = bool(cfg.get("persona_state_enabled", False))
+        mf = str(cfg.get("memory_file") or "memory.json")
+        base = os.path.dirname(os.path.abspath(mf)) or "."
+        store = PersonaStateStore(os.path.join(base, "persona_state.json"))
+        names = {}
+        try:
+            ch, is_bot = self._mem_channel()
+            data = (ch.memory_overview() if is_bot else ch.overview()) or {}
+            for chat in data:
+                names[memory_key(chat)] = chat
+        except Exception:
+            pass
+        rows = []
+        for k, st in store.snapshot().items():
+            rows.append({
+                "chat": names.get(k, k),
+                "mood": str(st.get("mood") or "").strip() or None,
+                "energy": st.get("energy"),
+                "ts": st.get("ts"),
+            })
+        rows.sort(key=lambda r: -(r.get("ts") or 0))
+        return {"ok": True, "enabled": enabled,
+                "period": period_label(), "rows": rows}
+
+    @_safe
+    def get_config(self) -> dict:
+        cfg = self.ctx.cfg
+        co = cfg.get("card_opacity")
+        po = cfg.get("panel_opacity")
+        ui = {
+            "theme": cfg.get("theme", "abyss"),
+            "follow_system": bool(cfg.get("follow_system")),
+            "wallpaper_path": cfg.get("wallpaper_path", ""),
+            # 0.5 是旧版默认值 → 视为未定制，跟随主题推荐 alpha
+            "card_opacity": None if co in (None, 0.5) else co,
+            "panel_opacity": None if po in (None, 0.5) else po,
+            "wall_opacity": cfg.get("wall_opacity"),
+            "blur_level": cfg.get("blur_level"),
+            "font_scale": cfg.get("font_scale", "medium"),
+        }
+        misc = {
+            "memory_deep_enabled": cfg.get("memory_deep_enabled", True),
+            "memory_compress_enabled": cfg.get("memory_compress_enabled", False),
+            "memory_keep_recent": cfg.get("memory_keep_recent", 30),
+            "memory_rolling_step": cfg.get("memory_rolling_step", 30),
+            "memory_compress_batch": cfg.get("memory_compress_batch", 30),
+            "memory_important_max": cfg.get("memory_important_max", 20),
+            "memory_compress_model": cfg.get("memory_compress_model", ""),
+            "max_context_tokens": cfg.get("max_context_tokens", 100000),
+            "reply_max_tokens": cfg.get("reply_max_tokens", 40000),
+            "segment_wait_enabled": cfg.get("segment_wait_enabled", True),
+            "segment_wait_seconds": cfg.get("segment_wait_seconds", 2.0),
+            "segment_jitter_enabled": cfg.get("segment_jitter_enabled", False),
+            "segment_jitter_min": cfg.get("segment_jitter_min", 1.5),
+            "segment_jitter_max": cfg.get("segment_jitter_max", 3.0),
+            "file_storage_path": cfg.get("file_storage_path", ""),
+            "tasks_dir": cfg.get("tasks_dir", ""),
+            "tianshu_workdir": cfg.get("tianshu_workdir", ""),
+            "web_proxy": cfg.get("web_proxy", ""),
+            "first_prompt_path": cfg.get("first_prompt_path", ""),
+            "bot_nickname": cfg.get("bot_nickname", "小漓"),
+            "start_paused": cfg.get("start_paused", True),
+            "web_search_enabled": cfg.get("web_search_enabled", True),
+            "task_enabled": cfg.get("task_enabled", False),
+            "state_watch_enabled": cfg.get("state_watch_enabled", False),
+            "model_trigger_manage": cfg.get("model_trigger_manage", "off"),
+            "sticker_mode": cfg.get("sticker_mode", "off"),
+            # 三个新开关必须出现在回显里（真机事故：保存/hot 写都生效，但
+            # get_config 的手写键表没带它们 → 设置页永远显示"关"，用户以为
+            # 开关坏了）
+            "no_reply_enabled": bool(cfg.get("no_reply_enabled", False)),
+            "global_memory_enabled": bool(cfg.get("global_memory_enabled", False)),
+            "shared_pool_enabled": bool(cfg.get("shared_pool_enabled", False)),
+            "persona_state_enabled": bool(cfg.get("persona_state_enabled", False)),
+            "media_wait_mode": cfg.get("media_wait_mode", "fixed"),
+            "media_wait_seconds": cfg.get("media_wait_seconds", 10),
+            "media_wait_quiet_seconds": cfg.get("media_wait_quiet_seconds", 5),
+            "followup_enabled": bool(cfg.get("followup_enabled", False)),
+            "followup_delay_min": cfg.get("followup_delay_min", 45),
+            "followup_delay_max": cfg.get("followup_delay_max", 90),
+            "followup_cooldown_minutes": cfg.get("followup_cooldown_minutes", 120),
+            "followup_daily_max": cfg.get("followup_daily_max", 10),
+            "followup_private_only": bool(cfg.get("followup_private_only", True)),
+            "group_reply_mode": cfg.get("group_reply_mode", "mention"),
+            "proactive_enabled": bool(cfg.get("proactive_enabled", False)),
+            "proactive_interval_min": cfg.get("proactive_interval_min", 10),
+            "proactive_interval_max": cfg.get("proactive_interval_max", 20),
+            "proactive_idle_minutes": cfg.get("proactive_idle_minutes", 10),
+            "proactive_cooldown_minutes": cfg.get(
+                "proactive_cooldown_minutes", 30),
+            "proactive_private_only": bool(
+                cfg.get("proactive_private_only", True)),
+            "proactive_active_days": cfg.get("proactive_active_days", 7),
+            "proactive_quiet_enabled": bool(
+                cfg.get("proactive_quiet_enabled", False)),
+            "proactive_quiet_start": cfg.get("proactive_quiet_start", "23:00"),
+            "proactive_quiet_end": cfg.get("proactive_quiet_end", "08:00"),
+            "daily_cost_limit_enabled": bool(cfg.get("daily_cost_limit_enabled", False)),
+            "daily_cost_limit": cfg.get("daily_cost_limit", 10.0),
+            "media_send_enabled": bool(cfg.get("media_send_enabled", False)),
+            "image_gen_endpoint": cfg.get("image_gen_endpoint", ""),
+            "image_gen_model": cfg.get("image_gen_model", ""),
+            "image_gen_api_key": cfg.get("image_gen_api_key", ""),
+            "remote_enabled": bool(cfg.get("remote_enabled", False)),
+            "remote_lan": bool(cfg.get("remote_lan", False)),
+            "remote_port": int(cfg.get("remote_port") or 8765),
+            "tianshu_guided": bool(cfg.get("tianshu_guided")),
+        }
+        voice = {
+            "voice_mode": cfg.get("voice_mode", "off"),
+            "tts_endpoint": cfg.get("tts_endpoint", ""),
+            "tts_timeout_seconds": cfg.get("tts_timeout_seconds", 120),
+            "voice_max_seconds": cfg.get("voice_max_seconds", 55),
+            "voice_profiles": cfg.get("voice_profiles", []),
+            "active_voice_profile_id": cfg.get("active_voice_profile_id", ""),
+        }
+        return {"ok": True, "ui": ui, "misc": misc, "voice": voice,
+                "overrides": cfg.get("chat_feature_overrides", {}),
+                "active_card_id": cfg.get("active_card_id", ""),
+                "first_run_needed": _first_run_needed(self.ctx.cfg_path, cfg),
+                "onboarding_done": bool(cfg.get("onboarding_done", True)),
+                "docs_url": DOCS_URL,
+                "cfg_path": self.ctx.cfg_path}
+
+    @_safe
+    def save_config(self, patch: dict) -> dict:
+        """白名单键写入 + 落盘 + bot 热写（保持旧 UI「保存即热生效」语义）。"""
+        if not isinstance(patch, dict):
+            return {"ok": False, "error": "patch 必须是对象"}
+        cfg = self.ctx.cfg
+        applied = [k for k in patch if k in _ALLOWED_KEYS]
+        for k in applied:
+            cfg[k] = patch[k]
+        if "chat_feature_overrides" in applied:
+            # 键归一化对齐旧 UI：memory_key（剥引号变体与空白）
+            from .memory_store import memory_key
+            ov = patch["chat_feature_overrides"] or {}
+            cfg["chat_feature_overrides"] = {
+                memory_key(k): v for k, v in ov.items()}
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        if "web_proxy" in applied:
+            web_search.set_proxy(str(patch["web_proxy"] or ""))
+        bot = getattr(self.ctx.engine, "bot", None)
+        hot = []
+        if bot is not None:
+            for k in _BOT_HOT_KEYS:
+                if k in applied:
+                    setattr(bot, k, patch[k])
+                    hot.append(k)
+            if "memory_compress_model" in applied:
+                from wechat_bot import strip_model_prefix
+                bot.memory_compress_model = strip_model_prefix(
+                    str(patch["memory_compress_model"] or ""))
+                hot.append("memory_compress_model")
+            if "tts_timeout_seconds" in applied:
+                bot.tts_timeout = patch["tts_timeout_seconds"]
+                hot.append("tts_timeout_seconds")
+            if "chat_feature_overrides" in applied:
+                bot.chat_feature_overrides = patch["chat_feature_overrides"]
+                hot.append("chat_feature_overrides")
+        # 远程面板三键有任一变更 → 按新配置启停/重启服务（token 不经 patch）
+        if {"remote_enabled", "remote_lan", "remote_port"} & set(applied):
+            self.sync_remote_server()
+        return {"ok": True, "applied": applied, "bot_hot": hot}
+
+    def _apply_nickname_to_card(self, name: str) -> bool:
+        """把微信名称写进**活跃角色卡**（昵称的事实源）。
+
+        project_config 用卡上的 nickname 投影 cfg.bot_nickname，多卡各有一套
+        人设与昵称——所以"改微信名称"必须落在卡上，只改 cfg 会被下一次投影
+        覆盖掉（历史缺陷：首启向导的"微信昵称"框填的值就是这么失效的）。
+        失败只记日志（卡不存在/写盘失败不阻塞昵称生效），返回是否写入。
+        """
+        cid = str(self.ctx.cfg.get("active_card_id") or "")
+        if not cid:
+            return False
+        try:
+            card = cs_get_card(self.ctx.cards_dir, cid)
+            if not card:
+                return False
+            card["nickname"] = name
+            cs_save_card(self.ctx.cards_dir, card)
+            return True
+        except Exception as e:
+            logger.warning(f"[昵称] 写入角色卡失败（{cid}）: {e}")
+            return False
+
+    @_safe
+    def set_nickname(self, value: str) -> dict:
+        """改「微信名称」：群里 @ 这个称呼认小漓，同时也是模型的自称。
+
+        写三处保持一致：活跃角色卡（事实源）→ cfg.bot_nickname（投影键，
+        供下次启动直接读到）→ 运行中 bot.nickname（@ 判据与提示词身份，
+        改完立即生效，不用重启引擎）。
+        """
+        name = " ".join(str(value or "").split())
+        if not name:
+            return {"ok": False, "error": "微信名称不能为空"}
+        if len(name) > 32:
+            return {"ok": False, "error": "微信名称过长（最多 32 个字）"}
+        cfg = self.ctx.cfg
+        card_written = self._apply_nickname_to_card(name)
+        cfg["bot_nickname"] = name
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        bot = getattr(self.ctx.engine, "bot", None)
+        if bot is not None:
+            bot.nickname = name
+        return {"ok": True, "nickname": name, "card_written": card_written}
+
+    @_safe
+    def get_providers(self) -> dict:
+        """Provider 表真值（仅本窗口 JS 可调，与旧 UI 表格同级的可见性）。"""
+        return {"ok": True, "providers": self.ctx.cfg.get("providers", [])}
+
+    @_safe
+    def set_theme(self, key: str) -> dict:
+        """切主题（配置落盘）+ 推荐壁纸联动（对齐旧 UI：库里有同名文件才应用）。"""
+        if key not in THEME_WALLPAPER:
+            return {"ok": False, "error": f"未知主题: {key}"}
+        cfg = self.ctx.cfg
+        cfg["theme"] = key
+        applied_wp = ""
+        rec = THEME_WALLPAPER.get(key)
+        if rec:
+            p = resolve_wallpaper_path(rec)
+            if p and os.path.isfile(p):
+                cfg["wallpaper_path"] = p
+                applied_wp = p
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        return {"ok": True, "theme": key, "wallpaper_applied": applied_wp}
+
+    # ---------- 壁纸 ----------
+
+    def _image_uri(self, path: str, kind: str) -> str | None:
+        """图片 → data URI（Pillow 编码；按 (path, kind) + mtime/size 缓存）。
+
+        thumb = 240x152 cover 裁剪缩略；full = 最长边 1600 等比缩。
+        WebView2 内置 http server 只 serve 前端目录，跨目录的壁纸图只能
+        以 data URI 注入，故不走 <img src> 文件路径。
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        key = (path, kind)
+        hit = self._img_cache.get(key)
+        if hit and hit[0] == (st.st_mtime, st.st_size):
+            return hit[1]
+        try:
+            im = Image.open(path)
+            im.load()
+            im = im.convert("RGB")
+            if kind == "thumb":
+                tw, th = 240, 152
+                target = tw / th
+                w, h = im.size
+                if w / h > target:
+                    nw = int(h * target)
+                    x = (w - nw) // 2
+                    im = im.crop((x, 0, x + nw, h))
+                else:
+                    nh = int(w / target)
+                    y = (h - nh) // 2
+                    im = im.crop((0, y, w, y + nh))
+                im = im.resize((tw, th), Image.LANCZOS)
+            else:
+                im.thumbnail((1600, 1600), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=85)
+            uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            return None
+        if len(self._img_cache) > 24:          # 简单防膨胀：超限整体清空
+            self._img_cache.clear()
+        self._img_cache[key] = ((st.st_mtime, st.st_size), uri)
+        return uri
+
+    @_safe
+    def list_wallpapers(self) -> dict:
+        items = []
+        for p, f in list_wallpapers():
+            items.append({"name": wallpaper_short_name(f), "path": p,
+                          "thumb": self._image_uri(p, "thumb")})
+        cur = str(self.ctx.cfg.get("wallpaper_path", "") or "")
+        cur_resolved = resolve_wallpaper_path(cur)
+        custom = None
+        if cur_resolved and os.path.isfile(cur_resolved) and \
+                not any(it["path"] == cur_resolved for it in items):
+            custom = {"name": "自定义: " + wallpaper_short_name(
+                          os.path.basename(cur_resolved)),
+                      "path": cur_resolved,
+                      "thumb": self._image_uri(cur_resolved, "thumb")}
+        return {"ok": True, "items": items, "custom": custom,
+                "current": cur, "current_resolved": cur_resolved,
+                "current_data": self._image_uri(cur_resolved, "full")
+                if cur_resolved and os.path.isfile(cur_resolved) else None}
+
+    @_safe
+    def set_wallpaper(self, path: str) -> dict:
+        """设置壁纸（空串 = 无壁纸，恢复纯渐变背景）。"""
+        cfg = self.ctx.cfg
+        cfg["wallpaper_path"] = str(path or "")
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        return {"ok": True, "wallpaper_path": cfg["wallpaper_path"]}
+
+    @_safe
+    def wallpaper_data(self, path: str) -> dict:
+        """取指定壁纸的全图 data URI（前端预览/切换时用）。"""
+        p = resolve_wallpaper_path(str(path or ""))
+        if not p or not os.path.isfile(p):
+            return {"ok": False, "error": "壁纸文件不存在"}
+        return {"ok": True, "path": p, "data": self._image_uri(p, "full")}
+
+    @_safe
+    def import_wallpaper(self) -> dict:
+        """系统文件对话框选图 → 存绝对路径（对齐旧 UI：自定义壁纸不复制）。"""
+        if self._win is None:
+            return {"ok": False, "error": "窗口未就绪"}
+        import webview
+        res = self._win.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False,
+            file_types=("图片 (*.jpg;*.jpeg;*.png;*.bmp;*.webp)",))
+        p = None
+        if isinstance(res, (list, tuple)) and res:
+            p = res[0]
+        elif isinstance(res, str) and res:
+            p = res
+        if not p:
+            return {"ok": True, "canceled": True}
+        p = os.path.abspath(p)
+        cfg = self.ctx.cfg
+        cfg["wallpaper_path"] = p
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        return {"ok": True, "path": p, "name": wallpaper_short_name(os.path.basename(p)),
+                "thumb": self._image_uri(p, "thumb"),
+                "data": self._image_uri(p, "full")}
+
+    # ---------- 触发器 ----------
+
+    @_safe
+    def list_triggers(self) -> dict:
+        items = RemindersStore().list()
+        now = time.time()
+        rows = []
+        for r in items:
+            st = trigger_state_text(r, now)
+            rows.append({**r, "state_text": st,
+                         "terminal": st in _TERMINAL_STATES})
+        rows.sort(key=lambda r: (r["terminal"],
+                                 r.get("fire_at") or r.get("expire_at")
+                                 or r.get("next_check_at") or 0))
+        return {"ok": True, "rows": rows,
+                "active": count_active_triggers(items)}
+
+    @_safe
+    def add_trigger(self, chat: str, content: str, fire_at: float,
+                    repeat: str = "once") -> dict:
+        r = RemindersStore().add(str(chat or "").strip(), str(content or "").strip(),
+                                 float(fire_at), str(repeat or "once"))
+        return {"ok": True, "item": r}
+
+    @_safe
+    def add_condition(self, chat: str, content: str, url: str, condition: str,
+                      judge: str = "local", match_type: str = "present",
+                      met_keywords=None, scope_start=None, scope_end=None,
+                      interval_seconds: int = 60, expire_at=None) -> dict:
+        r = RemindersStore().add_condition(
+            str(chat or "").strip(), str(content or "").strip(),
+            str(url or "").strip(), str(condition or "").strip(),
+            judge=str(judge or "local"), match_type=str(match_type or "present"),
+            met_keywords=met_keywords, scope_start=scope_start,
+            scope_end=scope_end, interval_seconds=int(interval_seconds or 60),
+            expire_at=float(expire_at) if expire_at else None)
+        return {"ok": True, "item": r}
+
+    @_safe
+    def set_trigger_enabled(self, rid: str, enabled: bool) -> dict:
+        return {"ok": bool(RemindersStore().set_enabled(str(rid), bool(enabled)))}
+
+    @_safe
+    def delete_trigger(self, rid: str) -> dict:
+        return {"ok": bool(RemindersStore().remove(str(rid)))}
+
+    # ---------- 角色卡 ----------
+
+    @_safe
+    def list_cards(self) -> dict:
+        cards = cs_list_cards(self.ctx.cards_dir)
+        return {"ok": True, "cards": cards,
+                "active_id": self.ctx.cfg.get("active_card_id", "")}
+
+    @_safe
+    def get_card(self, card_id: str) -> dict:
+        card = cs_get_card(self.ctx.cards_dir, str(card_id))
+        if card is None:
+            return {"ok": False, "error": "卡片不存在"}
+        return {"ok": True, "card": card}
+
+    @_safe
+    def save_card(self, card: dict) -> dict:
+        """新建/保存卡片；新卡 id 后缀用随机 hex（不在产物里写时间戳）。"""
+        card = dict(card or {})
+        cid = str(card.get("id") or "").strip()
+        if not cid:
+            base = "".join(c for c in str(card.get("name") or "")
+                           if c.isascii() and (c.isalnum() or c in "_-"))
+            cid = (base or "card") + "_" + os.urandom(3).hex()
+            card["id"] = cid
+        saved = cs_save_card(self.ctx.cards_dir, card)
+        new_cfg = self.ctx.reproject_and_push()
+        return {"ok": True, "card": saved, "active_card_id": new_cfg.get("active_card_id")}
+
+    @_safe
+    def delete_card(self, card_id: str) -> dict:
+        if str(card_id) == self.ctx.cfg.get("active_card_id"):
+            return {"ok": False, "error": "活跃卡不能删除（先激活别的卡）"}
+        return {"ok": bool(cs_delete_card(self.ctx.cards_dir, str(card_id)))}
+
+    @_safe
+    def duplicate_card(self, card_id: str) -> dict:
+        card = cs_duplicate_card(self.ctx.cards_dir, str(card_id))
+        return {"ok": True, "card": card}
+
+    @_safe
+    def activate_card(self, card_id: str) -> dict:
+        card = cs_get_card(self.ctx.cards_dir, str(card_id))
+        if card is None:
+            return {"ok": False, "error": "卡片不存在"}
+        cfg = self.ctx.cfg
+        cfg["active_card_id"] = str(card_id)
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        applied = False
+        try:
+            applied = bool(self.ctx.engine.apply_role(card, cfg.get("providers")))
+        except Exception:
+            applied = False
+        return {"ok": True, "hot_applied": applied}
+
+    @_safe
+    def export_card(self, card_id: str) -> dict:
+        card = cs_export_card(self.ctx.cards_dir, str(card_id))
+        return {"ok": True, "card": card}
+
+    @_safe
+    def import_card(self, data) -> dict:
+        saved = cs_import_card(self.ctx.cards_dir, data)
+        return {"ok": True, "card": saved}
+
+    # ---------- 模型 Provider ----------
+
+    @_safe
+    def save_providers(self, providers, chat_provider=None, chat_model=None) -> dict:
+        cfg = self.ctx.cfg
+        norm = []
+        for i, p in enumerate(providers or []):
+            if not isinstance(p, dict):
+                continue
+            models = p.get("models") or []
+            if isinstance(models, str):
+                models = [m.strip() for m in models.split(",") if m.strip()]
+            norm.append({"id": str(p.get("id") or f"p{i + 1}").strip(),
+                         "name": str(p.get("name") or "").strip(),
+                         "base_url": str(p.get("base_url") or "").strip(),
+                         "api_key": str(p.get("api_key") or "").strip(),
+                         "models": list(models)})
+        cfg["providers"] = norm
+        if chat_provider and chat_model:
+            card = cs_get_card(self.ctx.cards_dir,
+                               cfg.get("active_card_id", ""))
+            if card is not None:
+                card["chat_provider"] = str(chat_provider)
+                card["chat_model"] = str(chat_model)
+                cs_save_card(self.ctx.cards_dir, card)
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        self.ctx.reproject_and_push()
+        return {"ok": True, "providers": norm}
+
+    @_safe
+    def test_provider(self, base_url: str, api_key: str) -> dict:
+        """连接测试：GET {models 端点}，列前 20 个模型（15s 超时）。"""
+        import requests as rq
+        from wechat_bot import models_endpoint
+        url = models_endpoint(str(base_url or "").strip())
+        if not url:
+            return {"ok": False, "error": "Base URL 为空"}
+        try:
+            resp = rq.get(url, headers={"Authorization": f"Bearer {api_key or ''}"},
+                          timeout=15)
+        except rq.exceptions.RequestException as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        if resp.status_code != 200:
+            return {"ok": False, "error": f"HTTP {resp.status_code}"}
+        try:
+            data = resp.json().get("data") or []
+            names = [str(m.get("id") or "") for m in data if m.get("id")]
+        except ValueError:
+            return {"ok": False, "error": "响应不是有效 JSON"}
+        return {"ok": True, "models": names[:20], "total": len(names)}
+
+    # ---------- 记忆 ----------
+
+    def _mem_channel(self):
+        """bot 通道优先（运行中写盘节流一致）；未运行新建文件通道实例。"""
+        bot = getattr(self.ctx.engine, "bot", None)
+        if bot is not None and hasattr(bot, "memory_overview"):
+            return bot, True
+        m = MemoryStore(self.ctx.cfg.get("memory_file") or "memory.json")
+        m.load(deep_enabled=bool(self.ctx.cfg.get("memory_deep_enabled", True)))
+        return m, False
+
+    @_safe
+    def memory_overview(self) -> dict:
+        ch, is_bot = self._mem_channel()
+        data = (ch.memory_overview() if is_bot else ch.overview()) or {}
+        binds = self.ctx.cfg.get("chat_card_bindings", {}) or {}
+        cards = {c["id"]: c for c in cs_list_cards(self.ctx.cards_dir)}
+        rows = []
+        for chat, cnt in data.items():
+            cid = binds.get(memory_key(chat)) or binds.get(chat)
+            rows.append({"chat": chat, **(cnt or {}),
+                         "card_name": cards[cid]["name"] if cid in cards else None})
+        rows.sort(key=lambda r: r["chat"])
+        return {"ok": True, "rows": rows}
+
+    @_safe
+    def memory_detail(self, chat: str, deep_offset: int = 0, query: str = "") -> dict:
+        ch, is_bot = self._mem_channel()
+        d = (ch.memory_detail(str(chat), deep_offset, 200, str(query or "") or None)
+             if is_bot else
+             ch.detail(str(chat), deep_offset, 200, str(query or "") or None))
+        return {"ok": True, "chat": chat, **(d or {})}
+
+    @_safe
+    def memory_delete(self, kind: str, chat: str, idx: int) -> dict:
+        ch, _ = self._mem_channel()
+        chat = str(chat)
+        idx = int(idx)
+        if kind == "important":
+            ok = ch.delete_important(chat, idx)
+        elif kind == "recent":
+            ok = ch.delete_messages(chat, [idx])
+        elif kind == "index":
+            ok = ch.delete_index_entry(chat, idx)
+        elif kind == "deep":
+            ok = ch.delete_deep_message(chat, idx)
+        else:
+            return {"ok": False, "error": f"未知类别: {kind}"}
+        return {"ok": bool(ok)}
+
+    @_safe
+    def memory_clear_chat(self, chat: str) -> dict:
+        ch, _ = self._mem_channel()
+        return {"ok": bool(ch.clear_history(str(chat)))}
+
+    @_safe
+    def memory_clear_all(self) -> dict:
+        """清空全部记忆：引擎通道优先（绕开会旧记忆被节流写盘覆盖的坑）。"""
+        eng = self.ctx.engine
+        if hasattr(eng, "clear_memory"):
+            ok = bool(eng.clear_memory())
+            if ok:
+                return {"ok": True}
+        m, _ = self._mem_channel()
+        return {"ok": bool(m.clear_history(None))}
+
+    @_safe
+    def memory_export(self, chat: str, mode: str = "md") -> dict:
+        ch, _ = self._mem_channel()
+        data = ch.export_chat_data(str(chat))
+        if mode == "json":
+            content = json.dumps(data, ensure_ascii=False, indent=2)
+            name = f"{chat}-记忆.json"
+        else:
+            content = render_export_markdown(data)
+            name = f"{chat}-记忆.md"
+        return {"ok": True, "filename": name, "content": content}
+
+    @_safe
+    def memory_bind_card(self, chat: str, card_id: str) -> dict:
+        cfg = self.ctx.cfg
+        binds = cfg.setdefault("chat_card_bindings", {})
+        key = memory_key(str(chat))
+        if str(card_id or "").strip():
+            binds[key] = str(card_id)
+        else:
+            binds.pop(key, None)
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        self.ctx.reproject_and_push()
+        return {"ok": True}
+
+    def _mem_store(self):
+        """MemoryStore 实例：运行中走 bot 的同一 store（节流写盘一致），
+        未运行走文件级实例。注入/编辑必须与 bot 共用实例——绕开 bot 直接
+        写文件会被 bot 的节流写盘覆盖回来（clear_memory 同一教训）。"""
+        ch, _ = self._mem_channel()
+        return getattr(ch, "_mem", ch)
+
+    @_safe
+    def memory_add(self, chat: str, kind: str, content: str) -> dict:
+        """记忆注入：kind=important（重要记忆，常驻上下文，pinned 不被压缩
+        截尾）/ deep（深层存档，仅 recall 检索库）。"""
+        store = self._mem_store()
+        chat = str(chat)
+        if kind == "important":
+            ok = store.add_important(chat, str(content or ""))
+        elif kind == "deep":
+            ok = store.append_deep_manual(chat, str(content or ""))
+        else:
+            return {"ok": False, "error": f"未知类别: {kind}"}
+        return {"ok": bool(ok)}
+
+    @_safe
+    def memory_edit(self, chat: str, kind: str, idx: int, content: str = "",
+                    role: str = "", kw: str = "", mem: str = "") -> dict:
+        """记忆编辑：kind=important|recent|index|deep，idx 1 基。
+        index 的 kw 为逗号/顿号分隔字符串；recent 的 content/role 均可空
+        （空 = 不改该项）。"""
+        store = self._mem_store()
+        chat, idx = str(chat), int(idx)
+        if kind == "important":
+            ok = store.edit_important(chat, idx, content)
+        elif kind == "recent":
+            ok = store.edit_recent(chat, idx, content=content or None,
+                                   role=role or None)
+        elif kind == "index":
+            kws = [k.strip() for k in re.split(r"[,，、]", kw or "")
+                   if k.strip()]
+            ok = store.edit_index(chat, idx, kw=kws or None, mem=mem or None)
+        elif kind == "deep":
+            ok = store.edit_deep_message(chat, idx, content)
+        else:
+            return {"ok": False, "error": f"未知类别: {kind}"}
+        return {"ok": bool(ok)}
+
+    # ---- 全局记忆（跨聊天常驻注入；与聊天记忆同一套注入/编辑/删除） ----
+
+    @_safe
+    def memory_global_detail(self) -> dict:
+        store = self._mem_store()
+        return {"ok": True, **store.global_detail()}
+
+    @_safe
+    def memory_global_add(self, kind: str, content: str = "",
+                          kw: str = "", mem: str = "") -> dict:
+        """全局记忆注入：kind=important（常驻所有聊天的全局块）/
+        index（全局关键词索引，命中注入）。"""
+        store = self._mem_store()
+        if kind == "index":
+            kws = [k.strip() for k in re.split(r"[,，、]", kw or "")
+                   if k.strip()]
+            ok = store.global_add_index(kws, mem)
+        else:
+            ok = store.global_add(content)
+        return {"ok": bool(ok)}
+
+    @_safe
+    def memory_global_edit(self, kind: str, idx: int, content: str = "",
+                           kw: str = "", mem: str = "") -> dict:
+        store = self._mem_store()
+        idx = int(idx)
+        kws = [k.strip() for k in re.split(r"[,，、]", kw or "")
+               if k.strip()]
+        ok = store.global_edit(kind, idx, content=content or None,
+                               kw=kws or None, mem=mem or None)
+        return {"ok": bool(ok)}
+
+    @_safe
+    def memory_global_delete(self, kind: str, idx: int) -> dict:
+        store = self._mem_store()
+        return {"ok": bool(store.global_delete(str(kind), int(idx)))}
+
+    # ---------- 用量 ----------
+
+    @_safe
+    def get_usage(self) -> dict:
+        store = UsageStore()
+        records = store.load_records(days=30)
+        s = store.summary(days=30)
+        est = pricing.estimate_records(
+            records, days=30,
+            overrides=self.ctx.cfg.get("price_overrides") or {})
+        today, total = s["today"], s["total"]
+        cards = {
+            "today_calls": today["calls"],
+            "today_ok": today["ok"],
+            "today_fail": today["fail"],
+            "today_tokens": today["prompt"] + today["completion"],
+            "today_cache": hit_ratio(today),
+            "today_cost": est.get("today"),
+            "tokens_30d": total["prompt"] + total["completion"],
+            "fail_30d": total["fail"],
+            "cost_30d": est.get("total"),
+        }
+        by_model = []
+        for model, b in s["by_model"].items():
+            rp = s["reply_by_model"].get(model) or {}
+            avg = (rp["latency_sum"] / rp["count"] / 1000.0) if rp.get("count") else None
+            by_model.append({"model": model, "calls": b["calls"],
+                             "ok": b["ok"],
+                             "prompt": b["prompt"], "completion": b["completion"],
+                             "fail": b["fail"], "cache": hit_ratio(b),
+                             "avg_reply": avg, "est": b.get("est_calls", 0)})
+        # 近 7 天按天按模型调用量（排除端到端耗时记录 kind=reply、本地
+        # 估算行 src=est 与失败行——折线图只画成功且响应实测的调用）。
+        # 天键必须走 _day_key：SQLite 迁移后 ts 是 epoch 浮点，按字符串
+        # 切片得到的是秒数前缀，永远匹配不上日期键（历史缺陷：折线图
+        # 七天全零贴底不动）
+        import datetime
+        day_names = [(datetime.date.today() - datetime.timedelta(days=i))
+                     .isoformat() for i in range(6, -1, -1)]
+        day_model = {d: {} for d in day_names}
+        for r in records:
+            if (r.get("kind") == "reply" or r.get("src") in ("est", "fail")
+                    or r.get("ok") is False):
+                continue
+            day = store._day_key(r.get("ts") or time.time())
+            if day in day_model and r.get("model"):
+                m = day_model[day]
+                m[r["model"]] = m.get(r["model"], 0) + 1
+        # 每日预算进度（用量页进度条）：估算口径同预算闸（内置价目，无价目
+        # 不计入），limit<=0 视为未设上限（前端隐藏进度条）
+        budget = {
+            "enabled": bool(self.ctx.cfg.get("daily_cost_limit_enabled")),
+            "limit": float(self.ctx.cfg.get("daily_cost_limit") or 0),
+            "today": est.get("today") or 0.0,
+        }
+        return {"ok": True, "cards": cards, "by_model": by_model,
+                "days": day_names, "day_model": day_model,
+                "budget": budget}
+
+    @_safe
+    def refresh_balances(self) -> dict:
+        threading.Thread(target=self._balance_worker, daemon=True,
+                         name="xiaoli-balance").start()
+        return {"ok": True, "started": True}
+
+    def _balance_worker(self):
+        rows = []
+        for p in self.ctx.cfg.get("providers", []):
+            key = str(p.get("api_key") or "").strip()
+            if not key:
+                continue
+            if not balance.is_supported(p.get("id")):
+                rows.append({"name": p.get("name") or p.get("id"),
+                             "supported": False})
+                continue
+            r = balance.fetch_balance(p.get("id"), key)
+            rows.append({"name": p.get("name") or p.get("id"),
+                         "supported": True, **r})
+        self.push("balances", {"rows": rows})
+
+    @_safe
+    def clear_usage(self) -> dict:
+        return {"ok": bool(UsageStore().clear())}
+
+    # ---------- 语音自检 ----------
+
+    def _voice_ready_report(self):
+        """语音就绪判定（与 wechat_bot._voice_profile_ready 同口径：端点 +
+        激活档案 + 「通用」参考齐全）。返回 (profile or None, missing 列表)。
+        读 ctx.cfg 现值——save_config 落盘前已热写同一份 dict，设置页保存
+        即时反映。"""
+        cfg = self.ctx.cfg
+        if not str(cfg.get("tts_endpoint") or "").strip():
+            return None, ["未配置 TTS 端点"]
+        pid = str(cfg.get("active_voice_profile_id") or "")
+        profile = next((p for p in (cfg.get("voice_profiles") or [])
+                        if isinstance(p, dict) and str(p.get("id") or "") == pid),
+                       None)
+        if profile is None:
+            return None, ["未激活任何音色档案"]
+        base = (profile.get("refs") or {}).get("通用") or {}
+        missing = []
+        if not str(base.get("ref_audio_path") or "").strip():
+            missing.append("「通用」参考音频路径")
+        if not str(base.get("prompt_text") or "").strip():
+            missing.append("「通用」参考文本稿")
+        if missing:
+            return None, missing
+        return profile, []
+
+    @_safe
+    def voice_ready(self) -> dict:
+        """语音就绪状态灯（纯本地判定，零 API）。"""
+        profile, missing = self._voice_ready_report()
+        return {"ok": True, "ready": profile is not None, "missing": missing}
+
+    @_safe
+    def voice_selftest(self) -> dict:
+        """语音自检（长操作：daemon 线程 + push('voice_test') 回传）。
+
+        先按就绪口径逐项报缺什么；全齐则用激活档案的「通用」参考真实合成
+        一句问候，wav 以 base64 data URI 回传前端试听——用户当场验证自己
+        接入的 TTS 服务是否可用（合成失败同样回传明确原因）。"""
+        if getattr(self, "_voice_testing", False):
+            return {"ok": False, "error": "自检已在进行中"}
+        self._voice_testing = True
+
+        def worker():
+            try:
+                profile, missing = self._voice_ready_report()
+                if profile is None:
+                    self.push("voice_test",
+                              {"ok": False, "ready": False,
+                               "message": "语音未就绪：缺 " + "、".join(missing)})
+                    return
+                from .tts import GptSovitsClient, TtsError, wav_duration_seconds
+                client = GptSovitsClient(
+                    str(self.ctx.cfg.get("tts_endpoint") or ""),
+                    timeout=max(10, int(self.ctx.cfg.get("tts_timeout_seconds", 120))))
+                wav = client.synthesize("你好呀，我是小漓！", profile["refs"]["通用"])
+                dur = wav_duration_seconds(wav)
+                audio = ("data:audio/wav;base64,"
+                         + base64.b64encode(wav).decode("ascii"))
+                self.push("voice_test", {"ok": True, "ready": True,
+                                         "duration": round(dur, 1), "audio": audio})
+            except Exception as e:
+                self.push("voice_test",
+                          {"ok": False, "ready": False,
+                           "message": f"合成失败：{e}"})
+            finally:
+                self._voice_testing = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="xiaoli-voice-test").start()
+        return {"ok": True, "started": True}
+
+    # ---------- 表情包库 ----------
+
+    def _sticker_store_bridge(self):
+        from .sticker_store import StickerStore, default_stickers_dir
+        return StickerStore(default_stickers_dir())
+
+    @_safe
+    def sticker_info(self) -> dict:
+        """表情包库信息（设置页卡片 + 管理弹窗）：目录、文件清单与描述
+        （文件名播种 + manifest 缓存）+ 缩略图 data URI（复用壁纸的
+        _image_uri 缓存）。目录不存在返回空清单（功能整体不激活）。"""
+        store = self._sticker_store_bridge()
+        d = store.dir
+        items = []
+        for e in store.entries():
+            path = os.path.join(d, e["file"])
+            items.append({**e, "thumb": self._image_uri(path, "thumb")})
+        return {"ok": True, "dir": d, "count": len(items), "items": items}
+
+    @_safe
+    def sticker_set_desc(self, fname: str, desc: str, tags=None) -> dict:
+        """手动编辑单张表情包的描述与标签（管理弹窗行内保存）。"""
+        store = self._sticker_store_bridge()
+        if not store.set_entry(str(fname or ""), str(desc or ""), tags):
+            return {"ok": False, "error": "文件不存在于表情包库"}
+        return {"ok": True}
+
+    @_safe
+    def sticker_add_files(self) -> dict:
+        """系统文件对话框多选图片 → 复制进表情包库（重名覆盖跳过）。
+        新文件用文件名播种描述，可点「AI 优化标签」补看图描述。"""
+        if self._win is None:
+            return {"ok": False, "error": "窗口未就绪"}
+        import webview
+        res = self._win.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=True,
+            file_types=("图片 (*.jpg;*.jpeg;*.png;*.gif;*.webp)",))
+        paths = [p for p in (res or [])] if isinstance(res, (list, tuple)) \
+            else ([res] if isinstance(res, str) and res else [])
+        return self._sticker_copy_in(paths)
+
+    @_safe
+    def sticker_add_folder(self) -> dict:
+        """选文件夹 → 把其中（顶层）的图片文件复制进表情包库。"""
+        if self._win is None:
+            return {"ok": False, "error": "窗口未就绪"}
+        import webview
+        res = self._win.create_file_dialog(webview.FOLDER_DIALOG)
+        p = res[0] if isinstance(res, (list, tuple)) and res else (
+            res if isinstance(res, str) and res else None)
+        if not p:
+            return {"ok": True, "added": 0, "canceled": True}
+        try:
+            names = sorted(os.listdir(str(p)))
+        except OSError as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        paths = [os.path.join(str(p), n) for n in names
+                 if n.lower().endswith(
+                     (".png", ".jpg", ".jpeg", ".gif", ".webp"))]
+        return self._sticker_copy_in(paths)
+
+    def _sticker_copy_in(self, paths) -> dict:
+        """把选中的图片复制进库（裸文件名落盘；同名文件跳过——覆盖会悄悄
+        改掉用户已有的表情，宁可让用户先删旧的）。"""
+        import shutil
+        from .sticker_store import STICKER_EXTS
+        store = self._sticker_store_bridge()
+        added, skipped = 0, 0
+        for p in paths or []:
+            try:
+                p = os.path.abspath(str(p))
+                name = os.path.basename(p)
+                if not name.lower().endswith(STICKER_EXTS) \
+                        or not os.path.isfile(p):
+                    continue
+                dst = os.path.join(store.dir, name)
+                if os.path.exists(dst):
+                    skipped += 1
+                    continue
+                os.makedirs(store.dir, exist_ok=True)
+                shutil.copyfile(p, dst)
+                added += 1
+            except OSError as e:
+                logger.warning(f"[表情包] 复制失败 {p}: {e}")
+        if added:
+            self.push("sticker_lib_changed", {})
+        return {"ok": True, "added": added, "skipped": skipped}
+
+    @_safe
+    def sticker_open_dir(self) -> dict:
+        """用资源管理器打开表情包库目录。"""
+        store = self._sticker_store_bridge()
+        os.makedirs(store.dir, exist_ok=True)
+        os.startfile(store.dir)  # noqa: S606（Windows 资源管理器，用户主动）
+        return {"ok": True}
+
+    @_safe
+    def sticker_preview(self) -> dict:
+        """清单注入预览：返回与请求 system 消息**逐字一致**的正文 + token
+        估算（estimate_tokens 同口径），供用户判断 catalog 模式的上下文成本。"""
+        from .llm_client import estimate_tokens
+        from .sticker_store import catalog_text
+        store = self._sticker_store_bridge()
+        lines = store.catalog_lines()
+        if not lines:
+            return {"ok": True, "text": "", "count": 0, "tokens": 0}
+        text = catalog_text(lines)
+        return {"ok": True, "text": text, "count": len(lines),
+                "tokens": estimate_tokens(text)}
+
+    @_safe
+    def sticker_retag(self) -> dict:
+        """全库 AI 打标（长操作：daemon 线程 + push('sticker_retag') 进度）。
+
+        优先走运行中 bot 的视觉调用（重试/用量埋点同链路）；bot 未运行时
+        按投影配置直连。打标结果写回 manifest.json。"""
+        if getattr(self, "_sticker_retagging", False):
+            return {"ok": False, "error": "打标已在进行中"}
+        self._sticker_retagging = True
+
+        def worker():
+            try:
+                from .sticker_store import StickerStore, default_stickers_dir
+                store = StickerStore(default_stickers_dir())
+                bot = getattr(self.ctx.engine, "bot", None)
+                describe = None
+                if bot is not None and hasattr(bot, "_describe_sticker"):
+                    describe = bot._describe_sticker
+                else:
+                    from .llm_client import LlmClient
+                    from wechat_bot import strip_model_prefix
+                    client = LlmClient()
+                    url = str(self.ctx.cfg.get("ai_api_url") or "")
+                    key = str(self.ctx.cfg.get("ai_api_key") or "")
+                    model = strip_model_prefix(
+                        str(self.ctx.cfg.get("chat_model") or ""))
+
+                    def describe(path):
+                        from .sticker_store import describe_sticker
+                        return describe_sticker(client.post, url, key,
+                                                model, path)
+                if describe is None:
+                    self.push("sticker_retag",
+                              {"ok": False, "message": "视觉调用不可用"})
+                    return
+                ok, total = store.reindex(
+                    describe, progress_cb=lambda done, t:
+                    self.push("sticker_retag",
+                              {"ok": True, "done": done, "total": t}))
+                self.push("sticker_retag",
+                          {"ok": True, "done": total, "total": total,
+                           "indexed": ok,
+                           "message": f"打标完成：{ok}/{total}"})
+            except Exception as e:
+                self.push("sticker_retag",
+                          {"ok": False, "message": f"{type(e).__name__}: {e}"})
+            finally:
+                self._sticker_retagging = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="xiaoli-sticker-retag").start()
+        return {"ok": True, "started": True}
+
+    # ---------- 天枢配置引导（任务桥首次开启时） ----------
+
+    @_safe
+    def tianshu_guide_info(self) -> dict:
+        """引导弹窗初始状态：CLI 是否可用 / 是否已有 CLI 窗口 / 引导是否完成。
+
+        与老 Qt 版 run_first_run_guide 同一套判据（detect_rivet / CLI 窗口
+        特征），只是把模态弹窗换成 Web 弹窗。"""
+        from . import setup
+        rivet = setup.detect_rivet()
+        title = setup.find_cli_window()
+        return {"ok": True,
+                "installed": bool(rivet),
+                "detail": rivet or "未检测到 rivet 命令（需 npm install -g tianshu-tui）",
+                "window": title,
+                "guided": bool(self.ctx.cfg.get("tianshu_guided")),
+                "prompt_text": setup.GUIDE_PROMPT_TEXT}
+
+    @_safe
+    def tianshu_guide_open(self) -> dict:
+        """打开天枢 CLI 窗口，让用户在窗口里选模型 / 输 API key / 回车确认。"""
+        from . import setup
+        ok, detail = setup.launch_tianshu(self.ctx.cfg)
+        return {"ok": bool(ok), "detail": detail}
+
+    @_safe
+    def tianshu_guide_finish(self) -> dict:
+        """用户确认已在 CLI 完成配置：发 /yes（全自动，持久化）→ 关闭 CLI 窗口
+        → 标记 tianshu_guided=True（此后初始化不再引导）。
+
+        这里**只发 /yes 并关窗**（与引导文案承诺一致）。首轮提示词不在这里发：
+        它是任务桥协议说明，归属「引擎初始化完成时后台自动发一次」+ 首页
+        「重发一次」，且本流程紧接着会关窗（进程树被杀），在这里发等于发进一个
+        马上被销毁的会话——真机反馈：用户点「我已配置完成」后看到一大段协议文本
+        被粘贴进刚配好的 CLI，以为程序发错了东西。"""
+        from . import setup
+        title = setup.find_cli_window()
+        if not title:
+            return {"ok": False,
+                    "error": "未检测到天枢 CLI 窗口——请确认 CLI 窗口还开着"
+                             "（已关掉的话点「打开天枢 CLI」重开并完成配置）"}
+        if not setup.send_yes_and_close(title):
+            return {"ok": False, "error": "未能向天枢 CLI 发送 /yes，请重试"}
+        self.ctx.cfg["tianshu_guided"] = True
+        config_store.save_config(self.ctx.cfg, self.ctx.cfg_path)
+        return {"ok": True}
+
+    # ---------- 任务桥（任务页） ----------
+
+    @_safe
+    def list_tasks(self) -> dict:
+        """任务目录扫描（与 CLI task-status 共用 task_bridge.scan_task_status）：
+        waiting/done 来自顶层任务目录，archived 来自 sent/ 归档。"""
+        from .task_bridge import scan_task_status
+        tasks_dir = str(self.ctx.cfg.get("tasks_dir") or "").strip()
+        entries, waiting, done, archived = scan_task_status(tasks_dir)
+        rows = [{"name": n, "state": st, "desc": desc, "mtime": mt}
+                for (n, st, desc, mt) in entries]
+        return {"ok": True, "rows": rows, "waiting": waiting, "done": done,
+                "archived": archived, "tasks_dir": tasks_dir}
+
+    @_safe
+    def delete_task(self, name: str) -> dict:
+        """删除任务目录（waiting/done = 顶层；archived = sent/ 下的归档）。
+        前端必须先经用户确认；名字做路径安全校验（裸目录名，拒绝 sent 与
+        隐藏项），防拼接逃逸出任务根目录。"""
+        import shutil
+        tasks_dir = str(self.ctx.cfg.get("tasks_dir") or "").strip()
+        name = str(name or "").strip()
+        if not tasks_dir or not name or os.path.basename(name) != name \
+                or name == "sent" or name.startswith("."):
+            return {"ok": False, "error": "非法任务名"}
+        target = os.path.join(tasks_dir, name)
+        if not os.path.isdir(target):
+            return {"ok": False, "error": "任务目录不存在"}
+        shutil.rmtree(target, ignore_errors=True)
+        return {"ok": True, "deleted": name}
+
+    # ---------- 环境 / 天枢 / 更新 / 首轮提示词 ----------
+
+    @_safe
+    def check_env(self) -> dict:
+        return {"ok": True, "report": setup.check_environment(self.ctx.cfg)}
+
+    @_safe
+    def install_tianshu(self) -> dict:
+        """一键安装天枢 CLI（npm install -g tianshu-tui），后台线程 + 进度推送。
+
+        历史缺陷：这里下载 GitHub 源码 zip 解压到 ~/Tianshu——包里没有
+        可执行文件，check_environment 按 rivet 命令 / tianshu-desktop.exe
+        检测必然判「未安装」，且失败原因被丢弃，界面只见「安装完成」+
+        卡片「未安装」。现改走 CLI 安装（与检测同一判据，装完即就绪），
+        失败原因经 install 事件的 error 字段透出（前端 toast 显示）。"""
+        if self._installing:
+            return {"ok": False, "error": "已有安装任务进行中"}
+        self._installing = True
+
+        def worker():
+            try:
+                self.push("install", {
+                    "pct": 8, "done": False,
+                    "text": "正在通过 npm 安装天枢 CLI（首次约 1-3 分钟）…"})
+                ok, detail = setup.install_tianshu_cli()
+                if not ok:
+                    self.push("install", {"done": True, "ok": False,
+                                          "error": detail})
+                    return
+                self.push("install", {"pct": 100, "done": False})
+                self.push("install", {"done": True, "ok": True,
+                                      "detail": detail})
+            except Exception as e:
+                self.push("install", {"done": True, "ok": False,
+                                      "error": f"{type(e).__name__}: {e}"})
+            finally:
+                self._installing = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="xiaoli-install").start()
+        return {"ok": True, "started": True}
+
+    # ---------- 诊断导出（日志页「导出诊断包」） ----------
+
+    @staticmethod
+    def _mask_proxy_credentials(url: str) -> str:
+        """代理 URL 的 user:pass@ 打码（保留 host/port，排障仍能看出代理地址）。"""
+        return re.sub(r"(?<=://)[^/@\s]+@", "***@", str(url or ""))
+
+    @staticmethod
+    def _sanitize_cfg_for_export(cfg: dict) -> dict:
+        """导出用脱敏副本：API key/令牌一律 mask_key（providers 与 per-chat
+        绑定投影里的嵌套 key 一并处理），代理 URL 里的账号密码也打码；
+        其余配置原样——诊断正需要它们。"""
+        out = dict(cfg or {})
+        for k in ("ai_api_key", "vision_api_key", "image_gen_api_key",
+                  "remote_token"):
+            if out.get(k):
+                out[k] = config_store.mask_key(str(out[k]))
+        if out.get("web_proxy"):
+            out["web_proxy"] = BridgeApi._mask_proxy_credentials(
+                out["web_proxy"])
+        provs = out.get("providers")
+        if isinstance(provs, list):
+            out["providers"] = [
+                dict(p, api_key=config_store.mask_key(str(p.get("api_key") or "")))
+                if isinstance(p, dict) else p for p in provs]
+        params = out.get("chat_card_params")
+        if isinstance(params, dict):
+            out["chat_card_params"] = {
+                k: (dict(v, ai_api_key=config_store.mask_key(
+                    str(v.get("ai_api_key") or "")))
+                    if isinstance(v, dict) else v)
+                for k, v in params.items()}
+        return out
+
+    @_safe
+    def export_diagnostics(self) -> dict:
+        """打包运行诊断（zip）：环境快照 + 脱敏配置 + 运行日志尾部 + 微信
+        窗口截图（best-effort）。落 app_base_dir()/diagnostics/，文件名带
+        时刻（功能时间戳：多次导出不互相覆盖，与日志轮转同一性质）。
+        bot.log 全量（DEBUG 轨，含聊天文本）**不入包**——包内日志与日志页
+        看到的 INFO 轨一致，作 issue 附件刚好；PrintWindow 截图不抢焦点。"""
+        import zipfile
+        base = app_base_dir()
+        outdir = os.path.join(base, "diagnostics")
+        os.makedirs(outdir, exist_ok=True)
+        path = os.path.join(
+            outdir, time.strftime("xiaoli_diag_%Y%m%d_%H%M%S.zip"))
+
+        bot = getattr(self.ctx.engine, "bot", None)
+        wx = getattr(bot, "wx", None)
+        hwnd = getattr(wx, "_hwnd", None)
+        info = {
+            "app_version": APP_VERSION,
+            "python": sys.version,
+            "frozen": bool(getattr(sys, "frozen", False)),
+            "engine_state": getattr(self.ctx.engine, "state", None),
+            "wechat_window_found": hwnd is not None,
+            "wechat_window_rect": None,
+            "dpi_scale": None,
+            "work_area": None,
+            "boundary_x": getattr(wx, "_boundary_x", None),
+            "theme": getattr(wx, "theme", None),
+            "selected_row_color": getattr(wx, "_selected_row_color", None),
+            "config_path": self.ctx.cfg_path,
+        }
+        if hwnd is not None:
+            try:
+                from wx_backend.visual_win32 import (monitor_dpi_scale,
+                                                     monitor_work_area,
+                                                     window_rect)
+                info["wechat_window_rect"] = window_rect(hwnd)
+                info["dpi_scale"] = monitor_dpi_scale(hwnd)
+                info["work_area"] = monitor_work_area(hwnd)
+            except Exception as e:
+                logger.debug(f"[诊断] 窗口信息读取失败: {e}")
+
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("info.json",
+                        json.dumps(info, ensure_ascii=False, indent=2))
+            zf.writestr("config.json",
+                        json.dumps(self._sanitize_cfg_for_export(self.ctx.cfg),
+                                   ensure_ascii=False, indent=2))
+            try:
+                from wechat_bot import RUN_LOG_FILE
+                with open(RUN_LOG_FILE, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    lines = f.readlines()
+                zf.writestr("bot_run_tail.log", "".join(lines[-400:]))
+            except OSError as e:
+                logger.debug(f"[诊断] 运行日志读取失败: {e}")
+            if hwnd is not None:
+                try:
+                    from wx_backend.visual_win32 import capture_window
+                    shot = capture_window(hwnd)
+                    if shot is not None:
+                        buf = io.BytesIO()
+                        shot.convert("RGB").save(buf, format="PNG")
+                        zf.writestr("wechat_window.png", buf.getvalue())
+                except Exception as e:
+                    logger.debug(f"[诊断] 窗口截图失败: {e}")
+        logger.info(f"[诊断] 诊断包已导出: {path}")
+        return {"ok": True, "path": path}
+
+    @_safe
+    def reveal_path(self, path: str) -> dict:
+        """资源管理器打开文件所在目录（导出诊断后的「打开文件夹」；
+        本地语义——远程面板调它会在服务器上开窗口，已排除在白名单外）。"""
+        d = os.path.dirname(str(path or "")) or str(path or "")
+        if os.path.isdir(d):
+            os.startfile(d)  # noqa: 仅 Windows（本应用只在 Windows 跑）
+        return {"ok": True}
+
+    @_safe
+    def check_update(self) -> dict:
+        r = update_check.check_latest_release(
+            proxies=_proxies_from_cfg(self.ctx.cfg))
+        return {"ok": True, **(r or {})}
+
+    @_safe
+    def download_and_install_update(self) -> dict:
+        """一键更新（首页更新卡）：检查新版本 → 后台下载安装包（带进度
+        推送）→ 校验字节数 → 拉起安装器 → 自动退出本进程。安装器为 per-user
+        免管理员安装，用户按向导点完即升级；引擎/托盘由入口 finally 收尾。
+        下载走 web_proxy 设置（GitHub 直连不稳是常态，与联网搜索同一代理
+        语义）。仅桌面端可用（远程面板不开放——更新会断掉远程连接本身）。"""
+        if getattr(self, "_updating", False):
+            return {"ok": False, "error": "更新已在进行中"}
+        if self._win is None:
+            return {"ok": False, "error": "仅桌面端支持一键更新"}
+        proxies = _proxies_from_cfg(self.ctx.cfg)
+        r = update_check.check_latest_release(proxies=proxies)
+        if not r.get("ok"):
+            return {"ok": False, "error": r.get("error") or "检查更新失败"}
+        if not r.get("newer"):
+            return {"ok": False, "error": f"已是最新版本（v{r.get('current')}）"}
+        self._updating = True
+
+        def worker():
+            try:
+                ver = str(r.get("latest") or "")
+                asset = update_check.fetch_release_asset(ver, proxies=proxies)
+                if not asset or not asset.get("url"):
+                    self.push("update_progress", {
+                        "ok": False,
+                        "message": f"v{ver} 的安装包资产未找到，请去 Releases 页手动下载"})
+                    return
+                import subprocess
+                import tempfile
+                import requests as _rq
+                dest_dir = os.path.join(tempfile.gettempdir(), "xiaoli_update")
+                os.makedirs(dest_dir, exist_ok=True)
+                dest = os.path.join(dest_dir, asset["name"])
+                self.push("update_progress",
+                          {"stage": "download", "pct": 0})
+                with _rq.get(asset["url"], stream=True, timeout=(15, 300),
+                             proxies=proxies) as resp:
+                    if resp.status_code != 200:
+                        self.push("update_progress", {
+                            "ok": False,
+                            "message": f"下载失败（HTTP {resp.status_code}），"
+                                       "请去 Releases 页手动下载"})
+                        return
+                    total = int(resp.headers.get("Content-Length")
+                                or asset.get("size") or 0)
+                    done = 0
+                    last_pct = -5
+                    with open(dest, "wb") as f:
+                        for chunk in resp.iter_content(256 * 1024):
+                            f.write(chunk)
+                            done += len(chunk)
+                            pct = int(done * 100 / total) if total else 0
+                            if pct >= last_pct + 5:
+                                last_pct = pct
+                                self.push("update_progress",
+                                          {"stage": "download", "pct": pct})
+                if asset.get("size") and os.path.getsize(dest) != asset["size"]:
+                    self.push("update_progress", {
+                        "ok": False,
+                        "message": "下载文件大小与发布不符（可能下载不完整），"
+                                   "已放弃安装，请去 Releases 页手动下载"})
+                    return
+                self.push("update_progress", {
+                    "stage": "launch",
+                    "message": "下载完成，正在启动安装器——请按向导完成安装，"
+                               "小漓即将自动退出"})
+                subprocess.Popen([dest])
+                time.sleep(2.0)  # 给安装器起进程的时间，再退出释放文件占用
+                self.quit_app()
+            except Exception as e:
+                self.push("update_progress", {
+                    "ok": False,
+                    "message": f"更新失败（{type(e).__name__}），请去 "
+                               "Releases 页手动下载"})
+            finally:
+                self._updating = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="xiaoli-update").start()
+        return {"ok": True, "started": True, "version": r.get("latest")}
+
+    @_safe
+    def send_first_prompt(self) -> dict:
+        """后台发送首轮提示词（定位天枢 CLI 窗口 → 粘贴 → 两次回车）。
+        任务桥关闭时跳过——不唤起天枢也不发（天枢只服务于任务桥）。"""
+        if getattr(self, "_prompt_running", False):
+            return {"ok": False, "error": "发送已在进行中"}
+        if not self.ctx.cfg.get("task_enabled", False):
+            self.push("prompt", {"ok": False,
+                                 "message": "任务桥未开启（设置页可开启），已跳过天枢唤起与首轮提示词"})
+            return {"ok": True, "skipped": True}
+        self._prompt_running = True
+
+        def worker():
+            try:
+                cfg = self.ctx.cfg
+                text = setup.build_first_prompt(cfg)
+                fp = (cfg.get("first_prompt_path") or "").strip()
+                if fp and os.path.isfile(fp):
+                    try:
+                        setup.open_first_prompt(fp)
+                    except Exception:
+                        pass
+                title, detail = setup.resolve_cli_window(cfg)
+                if not title:
+                    self.push("prompt", {"ok": False, "message": detail})
+                    return
+                ok = setup.send_prompt_to_tianshu(text, title)
+                self.push("prompt", {"ok": bool(ok),
+                                     "message": "首轮提示词已发送给天枢 ✓"
+                                     if ok else "发送失败（窗口未响应粘贴）"})
+            except Exception as e:
+                self.push("prompt", {"ok": False,
+                                     "message": f"{type(e).__name__}: {e}"})
+            finally:
+                self._prompt_running = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="xiaoli-prompt").start()
+        return {"ok": True, "started": True}
+
+    # ---------- 首启引导 ----------
+
+    @_safe
+    def first_run_defaults(self) -> dict:
+        cfg = self.ctx.cfg
+        return {"ok": True,
+                "tasks_dir": cfg.get("tasks_dir", ""),
+                "file_storage_path": cfg.get("file_storage_path", "")
+                or default_wechat_files_dir(),
+                "memory_file": cfg.get("memory_file", "") or "memory.json",
+                "bot_nickname": cfg.get("bot_nickname", "") or "小漓"}
+
+    @_safe
+    def save_first_run(self, tasks_dir: str, file_storage_path: str,
+                       memory_file: str, bot_nickname: str) -> dict:
+        cfg = self.ctx.cfg
+        cfg["tasks_dir"] = str(tasks_dir or "").strip()
+        cfg["file_storage_path"] = str(file_storage_path or "").strip()
+        cfg["memory_file"] = str(memory_file or "").strip() or "memory.json"
+        name = str(bot_nickname or "").strip() or "小漓"
+        cfg["bot_nickname"] = name
+        # 昵称落到活跃角色卡（事实源）：只写 cfg 会被 project_config 的卡投影
+        # 覆盖回卡上的旧值——首启向导的"微信昵称"框就是这么失效的（历史缺陷）。
+        self._apply_nickname_to_card(name)
+        # 新装默认关任务桥：天枢 CLI 未配置前开着，模型会投递注定失败的任务。
+        # 引导路径 = 首次打开任务桥开关时的「天枢配置引导」弹窗；用户显式设过
+        # 该键的（老配置）不动。
+        if "task_enabled" not in cfg:
+            cfg["task_enabled"] = False
+        config_store.sync_workdir_to_tasks(cfg)
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        try:
+            setup.ensure_bridge_readme(cfg["tasks_dir"])
+        except Exception:
+            pass
+        try:
+            config_store.grant_tasks_dir_to_tianshu(cfg["tasks_dir"])
+        except Exception:
+            pass
+        return {"ok": True}
+
+    # ---------- 新手引导 ----------
+
+    def _active_card(self):
+        cid = str(self.ctx.cfg.get("active_card_id") or "")
+        return cs_get_card(self.ctx.cards_dir, cid) if cid else None
+
+    @staticmethod
+    def _provider_key_status(cfg: dict, card: dict | None) -> dict:
+        """模型可用性（不返回 Key 明文）：活跃卡的服务商是否有 Key + 模型。"""
+        providers = [p for p in (cfg.get("providers") or [])
+                     if isinstance(p, dict)]
+        pid = str((card or {}).get("chat_provider") or "")
+        provider = next((p for p in providers if p.get("id") == pid), None)
+        if provider is None:
+            provider = next((p for p in providers
+                             if str(p.get("api_key") or "").strip()), None)
+        if provider is None and providers:
+            provider = providers[0]
+        has_key = bool(provider and str(provider.get("api_key") or "").strip())
+        model = str((card or {}).get("chat_model")
+                    or cfg.get("chat_model") or "").strip()
+        name = str((provider or {}).get("name")
+                   or (provider or {}).get("id") or "")
+        if provider is None:
+            detail = "未配置模型服务商"
+        elif not has_key:
+            detail = f"{name} 未填写 API Key"
+        elif not model:
+            detail = "未选择对话模型"
+        else:
+            detail = f"{name} · {model}"
+        return {"ok": bool(provider and has_key and model),
+                "detail": detail,
+                "provider_id": str((provider or {}).get("id") or ""),
+                "model": model}
+
+    @_safe
+    def onboarding_status(self) -> dict:
+        """首启引导清单：微信/缩放/模型/角色卡/文件目录/引擎状态。
+
+        只返回布尔与可读文案，绝不返回 API Key/令牌明文。
+        """
+        cfg = self.ctx.cfg
+        report = setup.check_environment(cfg)
+        wechat = dict(report.get("wechat") or {"ok": False,
+                                               "detail": "未检测到微信窗口"})
+        # 最小化不是「未检测到」，但视觉通道此时是盲的——首启要单独提示
+        minimized = False
+        hwnd = None
+        try:
+            from wx_backend.visual_win32 import find_wechat_window
+            hwnd = find_wechat_window()
+            if hwnd:
+                import ctypes
+                minimized = bool(ctypes.windll.user32.IsIconic(hwnd))
+        except Exception:
+            pass
+        wechat["minimized"] = minimized
+        # check_environment 对「进程在、窗口没找到」是 ok=True（它要区分
+        # 没开微信和没登录完）；首启要更严格：没有主窗口就是不能开始监听。
+        wechat["window_found"] = hwnd is not None
+        card = self._active_card()
+        api = self._provider_key_status(cfg, card)
+        fdir = str(cfg.get("file_storage_path") or "").strip()
+        files_ok = bool(fdir and os.path.isdir(fdir))
+        engine = getattr(self.ctx, "engine", None)
+        return {
+            "ok": True,
+            "onboarding_done": bool(cfg.get("onboarding_done", True)),
+            "docs_url": DOCS_URL,
+            "wechat": wechat,
+            "scale": report.get("scale"),
+            "api": api,
+            "card": {"ok": card is not None,
+                     "id": str((card or {}).get("id") or ""),
+                     "name": str((card or {}).get("name") or ""),
+                     "nickname": str((card or {}).get("nickname")
+                                     or cfg.get("bot_nickname") or "小漓")},
+            "files_dir": {"ok": files_ok, "detail": fdir or "未配置"},
+            "engine": {"state": getattr(engine, "state", "idle"),
+                       "paused": bool(getattr(
+                           getattr(engine, "bot", None), "paused", False))},
+        }
+
+    @_safe
+    def onboarding_complete(self) -> dict:
+        """标记新手引导完成（前端「开始使用/跳过」收尾）。"""
+        self.ctx.cfg["onboarding_done"] = True
+        config_store.save_config(self.ctx.cfg, self.ctx.cfg_path)
+        return {"ok": True}
+
+    @_safe
+    def onboarding_reset(self) -> dict:
+        """重新运行新手引导（设置页入口）：只重置标记，不动配置。"""
+        self.ctx.cfg["onboarding_done"] = False
+        config_store.save_config(self.ctx.cfg, self.ctx.cfg_path)
+        return {"ok": True}
+
+    @_safe
+    def set_tasks_dir(self, new_dir: str, remove_old: bool = False) -> dict:
+        """变更任务工作目录。remove_old=True 时删除旧目录内容
+        （对齐旧 UI 行为；前端须先经用户确认）。"""
+        new_dir = str(new_dir or "").strip()
+        if not new_dir:
+            return {"ok": False, "error": "目录不能为空"}
+        cfg = self.ctx.cfg
+        old = str(cfg.get("tasks_dir") or "").strip()
+        if remove_old and old and os.path.isdir(old) \
+                and old != cfg.get("tianshu_workdir"):
+            shutil.rmtree(old, ignore_errors=True)
+        cfg["tasks_dir"] = new_dir
+        cfg["tianshu_guided"] = False
+        config_store.sync_workdir_to_tasks(cfg)
+        config_store.save_config(cfg, self.ctx.cfg_path)
+        try:
+            setup.ensure_bridge_readme(new_dir)
+        except Exception:
+            pass
+        try:
+            config_store.grant_tasks_dir_to_tianshu(new_dir)
+        except Exception:
+            pass
+        return {"ok": True, "tasks_dir": new_dir,
+                "removed_old": bool(remove_old and old and old != new_dir)}
+
+    # ---------- 文件对话框 ----------
+
+    @_safe
+    def pick_folder(self, title: str = "选择目录") -> dict:
+        if self._win is None:
+            return {"ok": False, "error": "窗口未就绪"}
+        import webview
+        res = self._win.create_file_dialog(webview.FOLDER_DIALOG)
+        p = res[0] if isinstance(res, (list, tuple)) and res else (
+            res if isinstance(res, str) and res else None)
+        return {"ok": True, "path": p, "canceled": not p}
+
+    @_safe
+    def pick_file(self, title: str = "选择文件",
+                  file_types=None) -> dict:
+        """通用文件选择（首轮提示词 / 卡片导入等）。"""
+        if self._win is None:
+            return {"ok": False, "error": "窗口未就绪"}
+        import webview
+        types = tuple(file_types) if file_types else ("所有文件 (*.*)",)
+        res = self._win.create_file_dialog(
+            webview.OPEN_DIALOG, allow_multiple=False, file_types=types)
+        p = res[0] if isinstance(res, (list, tuple)) and res else (
+            res if isinstance(res, str) and res else None)
+        return {"ok": True, "path": p, "canceled": not p}
+
+    @_safe
+    def open_external(self, url: str) -> dict:
+        """用系统默认程序打开外链（更新页等；WebView2 内不直接导航）。"""
+        import webbrowser
+        url = str(url or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return {"ok": False, "error": "非法链接"}
+        webbrowser.open(url)
+        return {"ok": True}
+
+    # ---------- 窗口控制 ----------
+
+    @_safe
+    def win_min(self) -> dict:
+        if self._win is not None:
+            self._win.minimize()
+        return {"ok": True}
+
+    @_safe
+    def win_max_toggle(self) -> dict:
+        """最大化 ⇄ 还原。pywebview Window 没有 maximized 状态属性可查，
+        桥侧自记状态（前端重复点击 / maximize 前置 hide 场景以自记为准）。"""
+        win = self._win
+        if win is None:
+            return {"ok": True}
+        self._max_state = not getattr(self, "_max_state", False)
+        try:
+            if self._max_state:
+                win.maximize()
+            else:
+                win.restore()
+        except Exception:
+            pass
+        return {"ok": True}
+
+    @_safe
+    def win_hide(self) -> dict:
+        """关窗按钮语义：隐藏到托盘（退出走托盘菜单）。"""
+        if self._win is not None:
+            self._win.hide()
+        self.notify("小漓", "已最小化到托盘，双击图标重新打开")
+        return {"ok": True}
+
+    @_safe
+    def quit_app(self) -> dict:
+        """真退出：销毁窗口令 webview.start() 返回，入口收尾停引擎/托盘。"""
+        self._stop.set()
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+        return {"ok": True}

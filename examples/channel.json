@@ -1,0 +1,17 @@
+{
+  "conversations": [
+    {
+      "kind": "friend",
+      "title": "测试好友小陈",
+      "endpoint": "http://127.0.0.1:8765/decide",
+      "private_reports": true,
+      "proactive": false
+    },
+    {
+      "kind": "group",
+      "title": "测试讨论组",
+      "endpoint": "http://127.0.0.1:8765/decide",
+      "proactive": true
+    }
+  ]
+}

@@ -1,0 +1,637 @@
+# -*- coding: utf-8 -*-
+"""联网搜索单测：多引擎 HTML 解析（百度/搜狗 h3 块、bing/DDG）、并发合并语义
+（优先级去重/单源降级/兜底链/失败抛错），以及 call_vision_api 的 web_search
+工具循环（结果回填/任务优先/次数封顶/失败降级）。"""
+import base64
+import threading
+import unittest
+from unittest import mock
+
+import wechat_bot as wb
+from xiaoli_app import web_search as ws
+
+
+def _ck_url(real):
+    """构造 Bing /ck/a 跳转包裹 URL（u = 'a1' 前缀 + 无填充 base64url）。"""
+    return ("https://www.bing.com/ck/a?!&u=a1"
+            + base64.urlsafe_b64encode(real.encode()).decode().rstrip("=")
+            + "&ntb=1")
+
+
+BING_HTML = """
+<html><body><ol>
+<li class="b_algo"><h2><a href="%s" h="ID=SERP,1.1">北京天气</a></h2>
+<div class="b_caption"><p class="b_lineclamp4">今天北京晴，气温 25 度</p></div></li>
+<li class="b_algo"><h2><a href="https://cn.bing.com/weather" h="ID=SERP,1.2">bing 天气</a></h2><p>内部链接应被过滤</p></li>
+<li class="b_algo"><h2><a href="https://example.org/news" h="ID=SERP,1.3">今日新闻</a></h2><p>第二条正常结果</p></li>
+</ol></body></html>
+""" % _ck_url("https://example.com/weather")
+
+DDG_HTML = """
+<html><body>
+<div class="result results_links">
+<h2 class="result__title"><a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fnews&amp;rut=abc">头条新闻</a></h2>
+<a class="result__snippet" href="//duckduckgo.com/l/?uddg=x">今天发生了一件大事</a>
+</div>
+</body></html>
+"""
+
+# 百度：h3 结果块 + /link?url= 重定向 + 摘要 + 内部链接应过滤
+BAIDU_HTML = """
+<html><body>
+<div class="result c-container"><h3 class="c-title"><a href="http://www.baidu.com/link?url=abc" target="_blank">李文华-经济与管理学院</a></h3>
+<span class="c-abstract">毕业于天津大学，现为云溪大学金融学教授。</span>
+<span>https://jgxy.example.edu.cn/i... 2023-06-16</span></div>
+<div class="result c-container"><h3 class="c-title"><a href="https://baike.baidu.com/item/x">李文华 百度百科</a></h3>
+<span class="c-abstract">云溪大学经济与管理学院教师。</span></div>
+<div class="result c-container"><h3><a href="https://www.baidu.com/s?wd=next">站内搜索</a></h3>
+<span>内部链接应被过滤</span></div>
+</body></html>
+"""
+
+# 搜狗：相对 /link?url= 需 urljoin 补全
+SOGOU_HTML = """
+<html><body>
+<div class="vrwrap"><h3><a href="/link?url=xyz">李文华 -经济与管理 学院</a></h3>
+毕业于天津大学原管理学院，现为云溪大学金融学教授。 云溪大学 https://jgxy.example.edu.cn/i... 2023-06-16 推荐您搜索</div>
+</body></html>
+"""
+
+
+def _resp(text, status=200):
+    resp = mock.Mock()
+    resp.status_code = status
+    resp.text = text
+    if status >= 400:
+        resp.raise_for_status.side_effect = ws.requests.HTTPError(str(status))
+    else:
+        resp.raise_for_status.return_value = None
+    return resp
+
+
+def _bing_ddg_fake_get(bing_text, ddg_text):
+    """按 URL 分流 bing/DDG 的 requests.get 替身。"""
+    def fake_get(url, **kwargs):
+        if "bing.com" in url:
+            return _resp(bing_text)
+        return _resp(ddg_text)
+    return fake_get
+
+
+class TestBingParse(unittest.TestCase):
+    def test_parse_filters_internal_and_decodes_redirect(self):
+        fake = _bing_ddg_fake_get(BING_HTML, "")
+        with mock.patch.object(ws.requests, "get", side_effect=fake) as m:
+            results = ws.web_search("北京天气", backends=("bing",))
+        self.assertEqual(m.call_args.kwargs["params"], {"q": "北京天气"})
+        self.assertEqual(len(results), 2)  # bing 内部链接被过滤
+        self.assertEqual(results[0]["url"], "https://example.com/weather")
+        self.assertEqual(results[0]["title"], "北京天气")
+        self.assertEqual(results[0]["snippet"], "今天北京晴，气温 25 度")
+        self.assertEqual(results[1]["url"], "https://example.org/news")
+
+
+class TestDdgParse(unittest.TestCase):
+    def test_parse_decodes_uddg_redirect(self):
+        fake = _bing_ddg_fake_get("", DDG_HTML)
+        with mock.patch.object(ws.requests, "get", side_effect=fake):
+            results = ws.web_search("新闻", backends=("duckduckgo",))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["url"], "https://example.com/news")
+        self.assertEqual(results[0]["title"], "头条新闻")
+        self.assertEqual(results[0]["snippet"], "今天发生了一件大事")
+
+
+class TestBaiduSogouParse(unittest.TestCase):
+    def test_baidu_h3_blocks_redirect_and_filter(self):
+        def fake_get(url, **kwargs):
+            self.assertIn("baidu.com", url)
+            return _resp(BAIDU_HTML)
+        with mock.patch.object(ws.requests, "get", side_effect=fake_get):
+            results = ws.web_search("云溪大学 李文华", backends=("baidu",))
+        self.assertEqual(len(results), 2)  # baidu /s 内部链接被过滤
+        self.assertEqual(results[0]["title"], "李文华-经济与管理学院")
+        self.assertEqual(results[0]["url"], "http://www.baidu.com/link?url=abc")
+        self.assertEqual(results[0]["source"], "baidu")
+        self.assertIn("云溪大学金融学教授", results[0]["snippet"])
+        # 摘要截掉展示网址/日期噪声
+        self.assertNotIn("jgxy.example", results[0]["snippet"])
+
+    def test_sogou_relative_link_urljoined(self):
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_resp(SOGOU_HTML)):
+            results = ws.web_search("云溪大学 李文华", backends=("sogou",))
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["url"],
+                         "https://www.sogou.com/link?url=xyz")
+        self.assertIn("金融学教授", results[0]["snippet"])
+        self.assertNotIn("推荐您搜索", results[0]["snippet"])
+
+    def test_baidu_verification_page_yields_empty(self):
+        # 安全验证页：200 + 无 h3 结果块 → 空结果自然降级（不抛错）
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_resp("<html><body>百度安全验证</body></html>")):
+            self.assertEqual(ws.web_search("q", backends=("baidu",)), [])
+
+
+class TestParallelMerge(unittest.TestCase):
+    """并发合并语义：优先级顺序 + 去重 + 单源降级 + 兜底链 + 失败抛错。"""
+
+    def _patch_backends(self, fakes):
+        # clear=True 完全接管后端表——未打桩的真实引擎不参与（否则测试
+        # 会发真网络请求）
+        return mock.patch.dict(ws._BACKENDS, fakes, clear=True)
+
+    def test_merge_priority_order_and_dedupe(self):
+        fakes = {
+            "baidu": lambda q, c: [{"title": "A", "url": "https://a", "snippet": ""}],
+            "bing": lambda q, c: [{"title": "B", "url": "https://b", "snippet": ""}],
+            "sogou": lambda q, c: [{"title": "A", "url": "https://a2", "snippet": ""}],
+        }
+        with self._patch_backends(fakes):
+            out = ws.web_search("q")
+        self.assertEqual([r["source"] for r in out], ["sogou", "bing"])  # 同题去重，搜狗优先
+
+    def test_blocked_source_degrades_to_others(self):
+        # 百度被安全验证拦截（空）→ 必应/搜狗照常补位
+        fakes = {
+            "baidu": lambda q, c: [],
+            "bing": lambda q, c: [{"title": "B", "url": "https://b", "snippet": "s"}],
+            "sogou": lambda q, c: [{"title": "C", "url": "https://c", "snippet": ""}],
+        }
+        with self._patch_backends(fakes):
+            out = ws.web_search("q")
+        self.assertEqual([r["source"] for r in out], ["sogou", "bing"])  # 优先级：搜狗在必应前
+
+    def test_parallel_error_degrades_to_other_sources(self):
+        def boom(q, c):
+            raise ws.requests.ConnectionError("boom")
+        fakes = {
+            "baidu": boom,
+            "bing": lambda q, c: [{"title": "B", "url": "https://b", "snippet": ""}],
+        }
+        with self._patch_backends(fakes):
+            out = ws.web_search("q")
+        self.assertEqual([r["source"] for r in out], ["bing"])
+
+    def test_all_parallel_empty_falls_to_ddg(self):
+        fakes = {
+            "baidu": lambda q, c: [],
+            "bing": lambda q, c: [],
+            "sogou": lambda q, c: [],
+            "duckduckgo": lambda q, c: [{"title": "D", "url": "https://d", "snippet": ""}],
+        }
+        with self._patch_backends(fakes):
+            out = ws.web_search("q")
+        self.assertEqual([r["source"] for r in out], ["duckduckgo"])
+
+    def test_fallback_excluded_when_in_primary_chain(self):
+        # backends 里已含 ddg 时不重复兜底
+        fakes = {"duckduckgo": lambda q, c: [{"title": "D", "url": "https://d", "snippet": ""}]}
+        with self._patch_backends(fakes):
+            out = ws.web_search("q", backends=("duckduckgo",))
+        self.assertEqual(len(out), 1)
+
+    def test_merged_results_capped_to_count(self):
+        fakes = {
+            "baidu": lambda q, c: [{"title": f"a{i}", "url": f"https://a{i}",
+                                    "snippet": ""} for i in range(5)],
+            "bing": lambda q, c: [{"title": f"b{i}", "url": f"https://b{i}",
+                                   "snippet": ""} for i in range(5)],
+            "sogou": lambda q, c: [],
+        }
+        with self._patch_backends(fakes):
+            out = ws.web_search("q")
+        self.assertEqual(len(out), ws.MAX_RESULTS)
+        self.assertEqual(out[0]["title"], "b0")  # 搜狗空 → 必应按优先级顶上
+
+    def test_all_backends_error_raises(self):
+        with mock.patch.object(ws.requests, "get",
+                               side_effect=ws.requests.ConnectionError("boom")):
+            with self.assertRaises(ws.WebSearchError):
+                ws.web_search("q")
+
+    def test_backend_responded_empty_returns_empty_list(self):
+        # 主链全部响应但无结果、兜底也响应无结果 → 确实没搜到，返回 [] 不抛
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_resp("<html><body></body></html>")):
+            self.assertEqual(ws.web_search("q"), [])
+
+    def test_unknown_backend_skipped(self):
+        fake = _bing_ddg_fake_get(BING_HTML, "")
+        with mock.patch.object(ws.requests, "get", side_effect=fake):
+            results = ws.web_search("q", backends=("nope", "bing"))
+        self.assertEqual(len(results), 2)
+
+
+class TestBingNewLayout(unittest.TestCase):
+    """2026-07 改版兜底：b_algo 块内 <h2> 消失，标题链接为块头裸 <a> 直链
+    （前置 tilk 图标链接须按主机跳过——真机日志：改版布局下必应零贡献）。"""
+
+    NEW_HTML = """
+    <li class="b_algo"><link rel="stylesheet" href="a.css"/>
+    <div class="b_tpcn"><a class="tilk" href="https://cn.bing.com/ck/a?x=1" h="ID=SERP,1.1">icon</a></div>
+    <a class="tilk" href="https://example.com/qishan" h="ID=SERP,1.2">东校区天气预报</a>
+    <div class="b_caption"><p class="b_lineclamp2">今天东校区阴，气温 25 度</p></div></li>
+    <li class="b_algo"><h2><a href="https://example.org/legacy">旧版结果</a></h2><p>旧版仍在</p></li>
+    """
+
+    def test_new_layout_bare_anchor_with_icon_skipped(self):
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_resp(self.NEW_HTML)):
+            results = ws._search_bing("q", 5)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0]["url"], "https://example.com/qishan")
+        self.assertEqual(results[0]["title"], "东校区天气预报")
+        self.assertIn("阴", results[0]["snippet"])
+        self.assertEqual(results[1]["url"], "https://example.org/legacy")
+
+    def test_backend_order_sogou_first(self):
+        """真机高频实测：百度 302 图形验证码全灭、搜狗唯一稳定供给 → 主链
+        顺序搜狗 > 必应 > 百度。"""
+        self.assertEqual(ws.DEFAULT_BACKENDS, ("sogou", "bing", "baidu"))
+
+
+class TestWebFetchRedirectStub(unittest.TestCase):
+    """搜狗 /link 返回 window.location.replace 桩（requests 不执行 JS →
+    零正文误判失败，真机事故）——web_fetch 必须提取跳转目标跟随再抓。"""
+
+    @staticmethod
+    def _resp_with(text, url, ctype="text/html; charset=utf-8"):
+        r = _resp(text)
+        r.headers = {"Content-Type": ctype}
+        r.url = url
+        return r
+
+    STUB_JS = ('<meta content="always" name="referrer">'
+               '<script>window.location.replace("https://tq.example/fuzhou/")</script>')
+    STUB_META = ("<noscript><META http-equiv=\"refresh\" "
+                 "content=\"0;URL='https://tq.example/fuzhou/'\"></noscript>")
+    REAL = "<html><body>" + "今天云溪阴转小雨，气温 25 到 30 度，湿度很大。" * 4 + "</body></html>"
+
+    def test_js_redirect_stub_followed(self):
+        side = [self._resp_with(self.STUB_JS, "https://www.sogou.com/link?url=x"),
+                self._resp_with(self.REAL, "https://tq.example/fuzhou/")]
+        with mock.patch.object(ws.requests, "get", side_effect=side) as m:
+            out = ws.web_fetch("https://www.sogou.com/link?url=x")
+        self.assertIn("阴转小雨", out)
+        self.assertEqual(m.call_count, 2)
+        self.assertEqual(m.call_args_list[1][0][0], "https://tq.example/fuzhou/")
+
+    def test_meta_refresh_stub_followed(self):
+        side = [self._resp_with(self.STUB_META, "https://www.sogou.com/link?url=y"),
+                self._resp_with(self.REAL, "https://tq.example/fuzhou/")]
+        with mock.patch.object(ws.requests, "get", side_effect=side):
+            self.assertIn("阴转小雨", ws.web_fetch("https://www.sogou.com/link?url=y"))
+
+    def test_hop_cap_then_error(self):
+        side = [self._resp_with(self.STUB_JS, "https://s/x") for _ in range(5)]
+        with mock.patch.object(ws.requests, "get", side_effect=side) as m:
+            with self.assertRaises(ws.WebFetchError):
+                ws.web_fetch("https://s/x")
+        self.assertEqual(m.call_count, ws.FETCH_MAX_HOPS)
+
+    def test_short_page_without_stub_raises_once(self):
+        side = [self._resp_with("<p>hi</p>", "https://s/x")]
+        with mock.patch.object(ws.requests, "get", side_effect=side) as m:
+            with self.assertRaises(ws.WebFetchError):
+                ws.web_fetch("https://s/x")
+        self.assertEqual(m.call_count, 1)
+
+    def test_relative_target_urljoined(self):
+        stub = '<script>location.href="/real/page"</script>'
+        side = [self._resp_with(stub, "https://s/link?u=1"),
+                self._resp_with(self.REAL, "https://s/real/page")]
+        with mock.patch.object(ws.requests, "get", side_effect=side) as m:
+            out = ws.web_fetch("https://s/link?u=1")
+        self.assertIn("阴转小雨", out)
+        self.assertEqual(m.call_args_list[1][0][0], "https://s/real/page")
+
+
+class TestResolveRedirect(unittest.TestCase):
+    """状态监视创建时把搜索引擎跳转链接解析成真实目标（失败原样返回）。"""
+
+    def test_js_stub_resolved_to_final_url(self):
+        stub = '<script>window.location.replace("https://tq.example/fuzhou/")</script>'
+        stub_resp = _resp(stub)
+        stub_resp.headers = {"Content-Type": "text/html"}
+        stub_resp.url = "https://www.sogou.com/link?url=x"
+        final_resp = _resp("<p>" + "正文" * 40 + "</p>")
+        final_resp.headers = {"Content-Type": "text/html"}
+        final_resp.url = "https://tq.example/fuzhou/"
+        with mock.patch.object(ws.requests, "get",
+                               side_effect=[stub_resp, final_resp]) as m:
+            out = ws.resolve_redirect("https://www.sogou.com/link?url=x")
+        self.assertEqual(out, "https://tq.example/fuzhou/")
+        self.assertEqual(m.call_count, 2)
+
+    def test_direct_page_returns_resp_url(self):
+        final_resp = _resp("<p>" + "正文" * 40 + "</p>")
+        final_resp.headers = {"Content-Type": "text/html"}
+        final_resp.url = "https://example.com/page"
+        with mock.patch.object(ws.requests, "get", return_value=final_resp):
+            out = ws.resolve_redirect("https://example.com/page")
+        self.assertEqual(out, "https://example.com/page")
+
+    def test_network_failure_returns_original(self):
+        with mock.patch.object(ws.requests, "get",
+                               side_effect=ws.requests.ConnectionError("boom")):
+            out = ws.resolve_redirect("https://www.sogou.com/link?url=x")
+        self.assertEqual(out, "https://www.sogou.com/link?url=x")
+
+
+class TestFormat(unittest.TestCase):
+    def test_format_with_and_without_results(self):
+        text = ws.format_search_results(
+            "q", [{"title": "T", "url": "https://u", "snippet": "S",
+                   "source": "baidu"}])
+        self.assertIn("1. T", text)
+        self.assertIn("（baidu）", text)
+        self.assertIn("S", text)
+        self.assertIn("https://u", text)
+        self.assertIn("没有搜到结果", ws.format_search_results("q", []))
+
+
+# ---------------- call_vision_api 的 web_search 工具循环 ----------------
+
+def make_bot():
+    bot = wb.WeChatBot.__new__(wb.WeChatBot)
+    bot.api_url = "https://api.test/v1/chat/completions"
+    bot.api_key = "k"
+    bot.chat_model = "test-model"
+    bot.chat_temperature = 0.7
+    bot.chat_top_p = 0.9
+    bot.api_retry = 2
+    bot.api_timeout = 5
+    bot.api_wall_budget = 45
+    bot.system_prompt = "你是小漓"
+    bot._model_lock = threading.RLock()
+    bot._get_history = lambda chat_id: []
+    bot.vision_api_url = bot.api_url
+    bot.vision_api_key = bot.api_key
+    bot.reply_max_tokens = 100
+    return bot
+
+
+def _search_call(qid="c1", query="北京天气"):
+    return {"id": qid, "type": "function",
+            "function": {"name": "web_search",
+                         "arguments": '{"query": "%s"}' % query}}
+
+
+class TestVisionSearchLoop(unittest.TestCase):
+    def test_search_roundtrip_feeds_results_back(self):
+        bot = make_bot()
+        payloads = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return {"choices": [{"message": {
+                    "content": "", "tool_calls": [_search_call()]}}]}
+            return {"choices": [{"message": {"content": "北京今天晴"}}]}
+
+        bot._post_chat_completions = fake_post
+        with mock.patch.object(wb, "web_search", return_value=[
+                {"title": "北京天气", "url": "https://u", "snippet": "晴"}]):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertEqual(out, {"kind": "text", "content": "北京今天晴"})
+        self.assertEqual(len(payloads), 2)
+        # 首轮 payload 声明了 web_search 工具
+        names = [t["function"]["name"] for t in payloads[0]["tools"]]
+        self.assertIn("web_search", names)
+        # 次轮消息含 assistant(tool_calls) 回填 + tool 结果
+        asst = [m for m in payloads[1]["messages"]
+                if m.get("role") == "assistant" and m.get("tool_calls")]
+        tool_msgs = [m for m in payloads[1]["messages"] if m.get("role") == "tool"]
+        self.assertEqual(len(asst), 1)
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertEqual(tool_msgs[0]["tool_call_id"], "c1")
+        self.assertIn("北京天气", tool_msgs[0]["content"])
+
+    def test_dispatch_priority_over_search(self):
+        bot = make_bot()
+        calls = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            calls.append(1)
+            return {"choices": [{"message": {"tool_calls": [
+                _search_call(),
+                {"id": "c2", "type": "function",
+                 "function": {"name": "dispatch_task",
+                              "arguments": '{"task": "做网站"}'}},
+            ]}}]}
+
+        bot._post_chat_completions = fake_post
+        search = mock.Mock()
+        with mock.patch.object(wb, "web_search", search):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertEqual(out["kind"], "tool_call")
+        self.assertEqual(out["name"], "dispatch_task")
+        self.assertEqual(len(calls), 1)  # 不做搜索往返
+        search.assert_not_called()
+
+    def test_loop_cap_returns_none(self):
+        bot = make_bot()
+        calls = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            calls.append(1)
+            return {"choices": [{"message": {"tool_calls": [_search_call()]}}]}
+
+        bot._post_chat_completions = fake_post
+        with mock.patch.object(wb, "web_search", return_value=[
+                {"title": "t", "url": "https://u", "snippet": ""}]):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertIsNone(out)
+        self.assertEqual(len(calls), wb.VISION_TOOL_ROUNDS)
+
+    def test_search_error_degrades_in_tool_message(self):
+        bot = make_bot()
+        payloads = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return {"choices": [{"message": {"tool_calls": [_search_call()]}}]}
+            return {"choices": [{"message": {"content": "搜不到，抱歉"}}]}
+
+        bot._post_chat_completions = fake_post
+        with mock.patch.object(wb, "web_search",
+                               side_effect=ws.WebSearchError("bing: x; duckduckgo: y")):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertEqual(out["content"], "搜不到，抱歉")
+        tool_msgs = [m for m in payloads[1]["messages"] if m.get("role") == "tool"]
+        self.assertIn("搜索暂时不可用", tool_msgs[0]["content"])
+
+    def test_bad_arguments_degrade_in_tool_message(self):
+        bot = make_bot()
+        payloads = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return {"choices": [{"message": {"tool_calls": [
+                    {"id": "c9", "type": "function",
+                     "function": {"name": "web_search", "arguments": "not-json"}}]}}]}
+            return {"choices": [{"message": {"content": "好"}}]}
+
+        bot._post_chat_completions = fake_post
+        search = mock.Mock()
+        with mock.patch.object(wb, "web_search", search):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertEqual(out["content"], "好")
+        search.assert_not_called()
+        tool_msgs = [m for m in payloads[1]["messages"] if m.get("role") == "tool"]
+        self.assertIn("缺少 query", tool_msgs[0]["content"])
+
+
+# ---------------- web_fetch：网页正文抓取 ----------------
+
+FETCH_HTML = """<html><head><style>.a{color:red}</style></head>
+<body><script>var x=1;</script><h1>云溪天气</h1>
+<!-- comment -->
+<p>今天 33℃ 多云，南风 2 级，湿度 71%，空气质量优，适合外出游玩。</p>
+<noscript>请开启JS</noscript></body></html>"""
+
+
+def _fetch_resp(html=FETCH_HTML, status=200, ctype="text/html; charset=utf-8",
+                encoding="utf-8"):
+    resp = mock.Mock()
+    resp.status_code = status
+    resp.headers = {"Content-Type": ctype}
+    resp.encoding = encoding
+    resp.apparent_encoding = None
+    resp.text = html
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+class TestWebFetch(unittest.TestCase):
+    def test_strips_script_style_comments_and_tags(self):
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_fetch_resp(FETCH_HTML)) as m:
+            text = ws.web_fetch("https://example.com/weather")
+        self.assertIn("云溪天气", text)
+        self.assertIn("33℃ 多云", text)
+        self.assertNotIn("var x", text)
+        self.assertNotIn(".a{", text)
+        self.assertNotIn("请开启JS", text)
+        self.assertNotIn("comment", text)
+        self.assertEqual(m.call_args.args[0], "https://example.com/weather")
+
+    def test_truncates_to_max_chars(self):
+        long_html = "<html><body>" + "字" * 5000 + "</body></html>"
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_fetch_resp(long_html)):
+            self.assertEqual(len(ws.web_fetch("https://e.com", max_chars=100)), 100)
+
+    def test_rejects_non_http_url(self):
+        with self.assertRaises(ws.WebFetchError):
+            ws.web_fetch("ftp://example.com/x")
+        with self.assertRaises(ws.WebFetchError):
+            ws.web_fetch("file:///C:/x")
+
+    def test_rejects_binary_content_type(self):
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_fetch_resp(ctype="image/jpeg")):
+            with self.assertRaises(ws.WebFetchError):
+                ws.web_fetch("https://e.com/a.jpg")
+
+    def test_http_error_raises(self):
+        resp = _fetch_resp(FETCH_HTML, status=404)
+        resp.raise_for_status.side_effect = ws.requests.HTTPError("404")
+        with mock.patch.object(ws.requests, "get", return_value=resp):
+            with self.assertRaises(ws.WebFetchError):
+                ws.web_fetch("https://e.com/404")
+
+    def test_empty_body_raises(self):
+        with mock.patch.object(ws.requests, "get",
+                               return_value=_fetch_resp("<html><body> </body></html>")):
+            with self.assertRaises(ws.WebFetchError):
+                ws.web_fetch("https://e.com/js-page")
+
+    def test_request_exception_raises(self):
+        with mock.patch.object(ws.requests, "get",
+                               side_effect=ws.requests.ConnectionError("boom")):
+            with self.assertRaises(ws.WebFetchError):
+                ws.web_fetch("https://e.com/x")
+
+
+# ---------------- 工具循环：web_fetch 分支 ----------------
+
+class TestVisionFetchLoop(unittest.TestCase):
+    def test_fetch_roundtrip_feeds_page_text_back(self):
+        bot = make_bot()
+        payloads = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return {"choices": [{"message": {"tool_calls": [
+                    {"id": "f1", "type": "function",
+                     "function": {"name": "web_fetch",
+                                  "arguments": '{"url": "https://www.tianqi.com/fuzhou/today/"}'}},
+                ]}}]}
+            return {"choices": [{"message": {"content": "云溪今天 33℃ 多云"}}]}
+
+        bot._post_chat_completions = fake_post
+        fetch = mock.Mock(return_value="云溪 33℃ 多云 湿度71%")
+        with mock.patch.object(wb, "web_fetch", fetch):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertEqual(out["content"], "云溪今天 33℃ 多云")
+        fetch.assert_called_once_with("https://www.tianqi.com/fuzhou/today/")
+        tool_msgs = [m for m in payloads[1]["messages"] if m.get("role") == "tool"]
+        self.assertEqual(tool_msgs[0]["tool_call_id"], "f1")
+        self.assertIn("33℃", tool_msgs[0]["content"])
+
+    def test_search_and_fetch_same_round_both_fed_back(self):
+        bot = make_bot()
+        payloads = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return {"choices": [{"message": {"tool_calls": [
+                    _search_call("s1", "云溪天气"),
+                    {"id": "f1", "type": "function",
+                     "function": {"name": "web_fetch",
+                                  "arguments": '{"url": "https://u"}'}},
+                ]}}]}
+            return {"choices": [{"message": {"content": "答"}}]}
+
+        bot._post_chat_completions = fake_post
+        with mock.patch.object(wb, "web_search", return_value=[]), \
+                mock.patch.object(wb, "web_fetch", return_value="页面正文"):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertEqual(out["content"], "答")
+        tool_msgs = [m for m in payloads[1]["messages"] if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+        self.assertIn("没有搜到结果", tool_msgs[0]["content"])
+        self.assertEqual(tool_msgs[1]["content"], "页面正文")
+
+    def test_fetch_error_degrades_in_tool_message(self):
+        bot = make_bot()
+        payloads = []
+
+        def fake_post(url, headers, payload, timeout, label="api", meta=None):
+            payloads.append(payload)
+            if len(payloads) == 1:
+                return {"choices": [{"message": {"tool_calls": [
+                    {"id": "f1", "type": "function",
+                     "function": {"name": "web_fetch",
+                                  "arguments": '{"url": "https://e.com/x"}'}},
+                ]}}]}
+            return {"choices": [{"message": {"content": "换个说法"}}]}
+
+        bot._post_chat_completions = fake_post
+        with mock.patch.object(wb, "web_fetch",
+                               side_effect=ws.WebFetchError("页面没有可读正文")):
+            out = bot.call_vision_api([{"type": "text", "text": "hi"}])
+        self.assertEqual(out["content"], "换个说法")
+        tool_msgs = [m for m in payloads[1]["messages"] if m.get("role") == "tool"]
+        self.assertIn("网页抓取失败", tool_msgs[0]["content"])
+
+
+if __name__ == "__main__":
+    unittest.main()

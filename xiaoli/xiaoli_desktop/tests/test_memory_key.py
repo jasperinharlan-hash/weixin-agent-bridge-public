@@ -1,0 +1,53 @@
+# -*- coding: utf-8 -*-
+"""memory 键归一化单测：引号与空格全剥、记忆存取同键（含 OCR 丢引号场景）。"""
+import os
+import tempfile
+import threading
+import unittest
+
+import wechat_bot as wb
+
+
+class TestMemoryKey(unittest.TestCase):
+    def test_quote_variants_stripped(self):
+        # 半/全角弯引号、直引号、全角引号、OCR 丢前引号 → 剥掉后同键
+        self.assertEqual(wb._memory_key("“摸鱼”集团"), "摸鱼集团")
+        self.assertEqual(wb._memory_key('摸鱼"集团'), "摸鱼集团")
+        self.assertEqual(wb._memory_key("＂摸鱼＂集团"), "摸鱼集团")
+        self.assertEqual(wb._memory_key("「摸鱼」集团"), "摸鱼集团")
+        self.assertEqual(wb._memory_key("摸鱼”集团"), "摸鱼集团")  # OCR 丢前引号
+
+    def test_whitespace_stripped(self):
+        self.assertEqual(wb._memory_key('" 摸鱼 " 集团'), "摸鱼集团")
+        self.assertEqual(wb._memory_key("林小满 "), "林小满")
+
+    def test_plain_name_unchanged(self):
+        self.assertEqual(wb._memory_key("林小满"), "林小满")
+        self.assertEqual(wb._memory_key(None), "")
+
+    def test_history_roundtrip_same_chat(self):
+        bot = wb.WeChatBot.__new__(wb.WeChatBot)
+        # memory_file 必须指向临时目录：桩不设它时 _mem 惰性建库会拿默认
+        # 相对路径，节流落盘（首存必写）把测试数据打进仓库工作目录
+        # （历史缺陷：仓库 memory.json 被本测试覆写成测试残留，.bak 机制上线后暴露）
+        bot.memory_file = os.path.join(tempfile.mkdtemp(), "memory.json")
+        bot.memory_db = {}
+        bot.max_history = 100
+        bot.memory_keep_recent = 30
+        bot.memory_deep_enabled = False
+        bot.memory_compress_enabled = False
+        bot._memory_lock = threading.RLock()
+        bot._deep_count = {}
+        bot._deep_dir = ""
+        # 各种 OCR 变体读写的应是同一份历史
+        bot._add_history("“摸鱼”集团", "user", "在吗")
+        self.assertEqual(len(bot._get_history("摸鱼”集团")), 1)   # 丢前引号
+        self.assertEqual(len(bot._get_history('摸鱼"集团')), 1)   # 半角直引号
+        self.assertEqual(len(bot._get_history('" 摸鱼 " 集团')), 1)  # 引号带空格
+        # 变体清空同样命中
+        bot.clear_history("＂摸鱼＂集团 ")
+        self.assertEqual(len(bot._get_history("「摸鱼」集团")), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
